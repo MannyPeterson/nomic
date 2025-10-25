@@ -15,7 +15,7 @@ Nomic C Code Analysis Copyright (C) 2025-2026 Manny Peterson
 
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, Tuple, Union, Literal, Any, Set, Iterable, Callable
+from typing import List, Dict, Optional, Tuple, Union, Literal, Any, Set, Iterable, Callable, Pattern
 import argparse
 import ast
 from collections import deque
@@ -359,11 +359,257 @@ class Statement:
             self.variables_read = _extract_identifiers(rhs)
         else:
             self.variables_read = _extract_identifiers(normalized)
-            self.variables_written = []
+        self.variables_written = []
 
 
 def _statement_from_text(text: str) -> "Statement":
     return Statement(text=text or "")
+
+
+def _coerce_pattern_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, Statement):
+        return value.text
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Function):
+        return "\n".join(stmt.text for stmt in value.all_statements)
+    if isinstance(value, BlockStmt):
+        return "\n".join(stmt.text for stmt in value.statements)
+    if isinstance(value, BasicBlock):
+        return "\n".join(stmt.text for stmt in value.statements)
+    if isinstance(value, (list, tuple, set)):
+        fragments = [_coerce_pattern_text(item) for item in value]
+        return "\n".join(fragment for fragment in fragments if fragment)
+    text_attr = getattr(value, "text", None)
+    if isinstance(text_attr, str):
+        return text_attr
+    return str(value)
+
+
+@dataclass
+class PatternMatch:
+    """Represents a single regex match result with helpful context."""
+    pattern: str
+    match: str
+    groups: Tuple[str, ...]
+    groupdict: Dict[str, str]
+    span: Tuple[int, int]
+    line_span: Tuple[int, int]
+    context: Any
+
+
+class _PatternEngine:
+    """Caches compiled regex patterns for reuse within the DSL."""
+
+    def __init__(self) -> None:
+        self._cache: Dict[Tuple[str, int], Pattern[str]] = {}
+
+    def compile(self, pattern: str, flags: int) -> Pattern[str]:
+        key = (pattern, flags)
+        compiled = self._cache.get(key)
+        if compiled is None:
+            compiled = re.compile(pattern, flags)
+            self._cache[key] = compiled
+        return compiled
+
+
+_PATTERN_ENGINE = _PatternEngine()
+
+
+def _pattern_flags(
+    *,
+    ignore_case: bool,
+    multiline: bool,
+    dotall: bool,
+    extra_flags: Optional[int] = None,
+) -> int:
+    flags = extra_flags or 0
+    if ignore_case:
+        flags |= re.IGNORECASE
+    if multiline:
+        flags |= re.MULTILINE
+    if dotall:
+        flags |= re.DOTALL
+    return flags
+
+
+def pattern_search(
+    target: Any,
+    pattern: str,
+    *,
+    ignore_case: bool = False,
+    multiline: bool = True,
+    dotall: bool = True,
+    literal: bool = False,
+    max_matches: int = 256,
+    flags: Optional[int] = None,
+) -> List[PatternMatch]:
+    """Return PatternMatch objects for regex hits over aggregated text."""
+    text = _coerce_pattern_text(target)
+    if not text or not pattern:
+        return []
+    effective_pattern = re.escape(pattern) if literal else pattern
+    compiled = _PATTERN_ENGINE.compile(
+        effective_pattern,
+        _pattern_flags(ignore_case=ignore_case, multiline=multiline, dotall=dotall, extra_flags=flags),
+    )
+    matches: List[PatternMatch] = []
+    limit = max_matches if max_matches > 0 else 256
+    for match in compiled.finditer(text):
+        start, end = match.span()
+        line_start = text.count("\n", 0, start) + 1
+        line_end = text.count("\n", 0, end) + 1
+        matches.append(
+            PatternMatch(
+                pattern=pattern,
+                match=match.group(0),
+                groups=match.groups(),
+                groupdict=match.groupdict(),
+                span=(start, end),
+                line_span=(line_start, line_end),
+                context=target,
+            )
+        )
+        if len(matches) >= limit:
+            break
+    return matches
+
+
+def pattern_matches(target: Any, pattern: str, **kwargs: Any) -> bool:
+    """Return True if the pattern matches anywhere in the target text."""
+    return bool(pattern_search(target, pattern, max_matches=1, **kwargs))
+
+
+def pattern_findall(target: Any, pattern: str, **kwargs: Any) -> List[str]:
+    """Return just the matched strings for convenience."""
+    return [match.match for match in pattern_search(target, pattern, **kwargs)]
+
+
+def pattern_extract(
+    target: Any,
+    pattern: str,
+    group: Union[int, str, None] = None,
+    **kwargs: Any,
+) -> List[Optional[str]]:
+    """Extract a specific capture group (by index or name) from each match."""
+    results: List[Optional[str]] = []
+    for match in pattern_search(target, pattern, **kwargs):
+        if group is None or group == 0:
+            results.append(match.match)
+        elif isinstance(group, int):
+            idx = group - 1
+            results.append(match.groups[idx] if 0 <= idx < len(match.groups) else None)
+        else:
+            results.append(match.groupdict.get(group))
+    return results
+
+
+@dataclass
+class SemanticMatch:
+    """Describes a statement whose semantic predicate and optional pattern matched."""
+    statement: Statement
+    block: Optional["BasicBlock"]
+    function: Optional["Function"]
+    pattern_match: Optional[PatternMatch]
+
+
+def _iter_statements_with_context(target: Any) -> Iterable[Tuple[Statement, Optional["BasicBlock"], Optional["Function"]]]:
+    if target is None:
+        return []
+    if isinstance(target, Function):
+        for block in target.cfg.blocks.values():
+            for stmt in block.statements:
+                yield stmt, block, target
+        return
+    if isinstance(target, BasicBlock):
+        function = target.function
+        for stmt in target.statements:
+            yield stmt, target, function
+        return
+    if isinstance(target, BlockStmt):
+        for stmt in target.statements:
+            yield stmt, None, None
+        return
+    if isinstance(target, Statement):
+        yield target, None, None
+        return
+    if isinstance(target, Iterable) and not isinstance(target, (str, bytes)):
+        for item in target:
+            yield from _iter_statements_with_context(item)
+        return
+    text = _coerce_pattern_text(target)
+    if text:
+        stmt = _statement_from_text(text)
+        yield stmt, None, None
+
+
+def _call_predicate(predicate: Optional[Callable[..., bool]], statement: Statement, block: Optional["BasicBlock"], function: Optional["Function"]) -> bool:
+    if predicate is None:
+        return True
+    try:
+        return bool(predicate(statement, block, function))
+    except TypeError:
+        return bool(predicate(statement))
+
+
+def _pattern_scope_text(statement: Statement, block: Optional["BasicBlock"], function: Optional["Function"], scope: str) -> str:
+    scope = (scope or "statement").lower()
+    if scope == "block" and block is not None:
+        return "\n".join(stmt.text for stmt in block.statements)
+    if scope == "function" and function is not None:
+        return "\n".join(stmt.text for stmt in function.all_statements)
+    return statement.text
+
+
+def semantic_pattern_matches(
+    target: Any,
+    *,
+    predicate: Optional[Callable[..., bool]] = None,
+    pattern: Optional[str] = None,
+    pattern_scope: str = "statement",
+    max_results: int = 256,
+    pattern_kwargs: Optional[Dict[str, Any]] = None,
+) -> List[SemanticMatch]:
+    """
+    Combine semantic predicates with (optional) regex pattern matching.
+    Returns SemanticMatch objects with surrounding context.
+    """
+    results: List[SemanticMatch] = []
+    pattern_kwargs = pattern_kwargs or {}
+    limit = max_results if max_results > 0 else 256
+    for statement, block, function in _iter_statements_with_context(target) or []:
+        if not _call_predicate(predicate, statement, block, function):
+            continue
+        if pattern:
+            text = _pattern_scope_text(statement, block, function, pattern_scope)
+            matches = pattern_search(text, pattern, **pattern_kwargs)
+            if not matches:
+                continue
+            for pm in matches:
+                results.append(SemanticMatch(statement=statement, block=block, function=function, pattern_match=pm))
+                if len(results) >= limit:
+                    return results
+        else:
+            results.append(SemanticMatch(statement=statement, block=block, function=function, pattern_match=None))
+            if len(results) >= limit:
+                return results
+    return results
+
+
+def semantic_pattern_any(target: Any, **kwargs: Any) -> bool:
+    """Boolean helper to quickly test if any semantic+pattern match exists."""
+    return bool(semantic_pattern_matches(target, max_results=1, **kwargs))
+
+
+def semantic_statements(target: Any, predicate: Optional[Callable[..., bool]] = None) -> List[Statement]:
+    """Return statements satisfying the provided semantic predicate."""
+    statements: List[Statement] = []
+    for statement, block, function in _iter_statements_with_context(target) or []:
+        if _call_predicate(predicate, statement, block, function):
+            statements.append(statement)
+    return statements
 
 
 @dataclass
@@ -1647,6 +1893,13 @@ class RuleEngine:
                 "is_api_function": self._make_env_callable(is_api_function),
                 "is_callback_function": self._make_env_callable(is_callback_function),
                 "is_syscall_function": self._make_env_callable(is_syscall_function),
+                "pattern_search": self._make_env_callable(pattern_search),
+                "pattern_matches": self._make_env_callable(pattern_matches),
+                "pattern_findall": self._make_env_callable(pattern_findall),
+                "pattern_extract": self._make_env_callable(pattern_extract),
+                "semantic_pattern_matches": self._make_env_callable(semantic_pattern_matches),
+                "semantic_pattern_any": self._make_env_callable(semantic_pattern_any),
+                "semantic_statements": self._make_env_callable(semantic_statements),
             }
         )
         return env
