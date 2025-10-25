@@ -16,7 +16,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Tuple, Union, Literal, Any, Set
 import argparse
+import ast
+from collections import deque
+from contextlib import contextmanager
+import functools
 import json
+import operator
 import os
 import re
 import shlex
@@ -223,6 +228,7 @@ class ControlFlowGraph:
 
         The actual dataflow/CFG logic will get implemented later.
         """
+        # TODO: real CFG/postdom analysis
         # TODO: real CFG/postdom analysis
         return True
 
@@ -505,18 +511,293 @@ class Violation:
 # ==================== RULE EVALUATION =======================
 # ============================================================
 
-SAFE_EVAL_GLOBALS: Dict[str, Any] = {
-    "__builtins__": {},
-    "len": len,
-    "any": any,
-    "all": all,
-    "sum": sum,
-    "min": min,
-    "max": max,
-    "sorted": sorted,
+
+def _mark_safe_callable(func: Any) -> Any:
+    setattr(func, "_nomic_safe_callable", True)
+    return func
+
+
+def _wrap_safe_callable(func: Any) -> Any:
+    @functools.wraps(func)
+    def _safe_wrapper(*args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+    return _mark_safe_callable(_safe_wrapper)
+
+
+def _wrap_dynamic_callable(func: Any) -> Any:
+    def _safe_wrapper(*args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+    return _mark_safe_callable(_safe_wrapper)
+
+
+_SAFE_BASE_CALLABLES: Dict[str, Any] = {
+    "len": _wrap_safe_callable(len),
+    "any": _wrap_safe_callable(any),
+    "all": _wrap_safe_callable(all),
+    "sum": _wrap_safe_callable(sum),
+    "min": _wrap_safe_callable(min),
+    "max": _wrap_safe_callable(max),
+    "sorted": _wrap_safe_callable(sorted),
+    "abs": _wrap_safe_callable(abs),
 }
 
 TEMPLATE_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+
+
+class ExpressionEvalError(Exception):
+    """Raised when the DSL expression evaluator encounters an unsafe or invalid construct."""
+
+
+class _SafeExpressionInterpreter:
+    """
+    Evaluates a restricted subset of Python expressions by walking the AST.
+    Supports boolean logic, arithmetic, comparisons, attribute access, indexing,
+    safe function calls, and literals/containers.
+    """
+
+    _BIN_OPS = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod,
+        ast.Pow: operator.pow,
+        ast.BitAnd: operator.and_,
+        ast.BitOr: operator.or_,
+        ast.BitXor: operator.xor,
+        ast.LShift: operator.lshift,
+        ast.RShift: operator.rshift,
+    }
+    _UNARY_OPS = {
+        ast.Not: operator.not_,
+        ast.USub: operator.neg,
+        ast.UAdd: operator.pos,
+        ast.Invert: operator.invert,
+    }
+
+    def __init__(self) -> None:
+        self._cache: Dict[str, ast.AST] = {}
+
+    def evaluate(self, expr: str, env: Dict[str, Any]) -> Any:
+        expr = expr.strip()
+        if not expr:
+            return True
+
+        try:
+            tree = self._cache.get(expr)
+            if tree is None:
+                tree = ast.parse(expr, mode="eval")
+                self._cache[expr] = tree
+        except SyntaxError as exc:  # pragma: no cover
+            raise ExpressionEvalError(f"invalid expression '{expr}': {exc}") from exc
+
+        return self._eval_node(tree.body, env)
+
+    def _eval_node(self, node: ast.AST, env: Dict[str, Any]) -> Any:
+        if isinstance(node, ast.BoolOp):
+            if isinstance(node.op, ast.And):
+                result = True
+                for value in node.values:
+                    result = result and bool(self._eval_node(value, env))
+                    if not result:
+                        break
+                return result
+            if isinstance(node.op, ast.Or):
+                result = False
+                for value in node.values:
+                    result = result or bool(self._eval_node(value, env))
+                    if result:
+                        break
+                return result
+            raise ExpressionEvalError("unsupported boolean operator")
+
+        if isinstance(node, ast.UnaryOp):
+            op = self._UNARY_OPS.get(type(node.op))
+            if not op:
+                raise ExpressionEvalError("unsupported unary operator")
+            operand = self._eval_node(node.operand, env)
+            return op(operand)
+
+        if isinstance(node, ast.BinOp):
+            op = self._BIN_OPS.get(type(node.op))
+            if not op:
+                raise ExpressionEvalError("unsupported binary operator")
+            left = self._eval_node(node.left, env)
+            right = self._eval_node(node.right, env)
+            return op(left, right)
+
+        if isinstance(node, ast.Compare):
+            left = self._eval_node(node.left, env)
+            for operator_node, comparator in zip(node.ops, node.comparators):
+                right = self._eval_node(comparator, env)
+                if not self._evaluate_comparison(operator_node, left, right):
+                    return False
+                left = right
+            return True
+
+        if isinstance(node, ast.IfExp):
+            condition = self._eval_node(node.test, env)
+            branch = node.body if condition else node.orelse
+            return self._eval_node(branch, env)
+
+        if isinstance(node, ast.Attribute):
+            value = self._eval_node(node.value, env)
+            if node.attr.startswith("_"):
+                raise ExpressionEvalError("access to private attributes is not allowed")
+            attr_value = getattr(value, node.attr)
+            if callable(attr_value) and not getattr(attr_value, "_nomic_safe_callable", False):
+                attr_value = _wrap_dynamic_callable(attr_value)
+            return attr_value
+
+        if isinstance(node, ast.Name):
+            if node.id in env:
+                return env[node.id]
+            raise ExpressionEvalError(f"unknown identifier '{node.id}'")
+
+        if isinstance(node, ast.Constant):
+            return node.value
+
+        if isinstance(node, ast.GeneratorExp):
+            return self._build_generator(node, env)
+
+        if isinstance(node, ast.ListComp):
+            return list(self._comprehension_values(node.generators, env, node.elt))
+
+        if isinstance(node, ast.SetComp):
+            return set(self._comprehension_values(node.generators, env, node.elt))
+
+        if isinstance(node, ast.DictComp):
+            return {
+                key: value
+                for key, value in self._comprehension_items(node.generators, env, node.key, node.value)
+            }
+
+        if isinstance(node, ast.Call):
+            func_obj = self._eval_node(node.func, env)
+            if not getattr(func_obj, "_nomic_safe_callable", False):
+                raise ExpressionEvalError("call to unsafe function is not allowed")
+            args = [self._eval_node(arg, env) for arg in node.args]
+            kwargs = {kw.arg: self._eval_node(kw.value, env) for kw in node.keywords if kw.arg}
+            return func_obj(*args, **kwargs)
+
+        if isinstance(node, ast.Subscript):
+            value = self._eval_node(node.value, env)
+            key = self._eval_slice(node.slice, env)
+            return value[key]
+
+        if isinstance(node, ast.List):
+            return [self._eval_node(elt, env) for elt in node.elts]
+
+        if isinstance(node, ast.Tuple):
+            return tuple(self._eval_node(elt, env) for elt in node.elts)
+
+        if isinstance(node, ast.Set):
+            return {self._eval_node(elt, env) for elt in node.elts}
+
+        if isinstance(node, ast.Dict):
+            keys = [self._eval_node(k, env) if k is not None else None for k in node.keys]
+            values = [self._eval_node(v, env) for v in node.values]
+            return {k: v for k, v in zip(keys, values)}
+
+        raise ExpressionEvalError(f"unsupported expression node: {type(node).__name__}")
+
+    def _eval_slice(self, slice_node: ast.AST, env: Dict[str, Any]) -> Any:
+        if isinstance(slice_node, ast.Slice):
+            lower = self._eval_node(slice_node.lower, env) if slice_node.lower else None
+            upper = self._eval_node(slice_node.upper, env) if slice_node.upper else None
+            step = self._eval_node(slice_node.step, env) if slice_node.step else None
+            return slice(lower, upper, step)
+        return self._eval_node(slice_node, env)
+
+    def _evaluate_comparison(self, operator_node: ast.AST, left: Any, right: Any) -> bool:
+        if isinstance(operator_node, ast.Eq):
+            return left == right
+        if isinstance(operator_node, ast.NotEq):
+            return left != right
+        if isinstance(operator_node, ast.Gt):
+            return left > right
+        if isinstance(operator_node, ast.GtE):
+            return left >= right
+        if isinstance(operator_node, ast.Lt):
+            return left < right
+        if isinstance(operator_node, ast.LtE):
+            return left <= right
+        if isinstance(operator_node, ast.In):
+            return left in right
+        if isinstance(operator_node, ast.NotIn):
+            return left not in right
+        if isinstance(operator_node, ast.Is):
+            return left is right
+        if isinstance(operator_node, ast.IsNot):
+            return left is not right
+        raise ExpressionEvalError("unsupported comparison operator")
+
+    def _build_generator(self, node: ast.GeneratorExp, env: Dict[str, Any]) -> Any:
+        def generator() -> Any:
+            yield from self._comprehension_values(node.generators, env, node.elt)
+
+        return generator()
+
+    def _comprehension_values(
+        self,
+        generators: List[ast.comprehension],
+        env: Dict[str, Any],
+        value_node: ast.AST,
+    ) -> Any:
+        yield from self._iterate_comprehension(generators, env, value_node, None)
+
+    def _comprehension_items(
+        self,
+        generators: List[ast.comprehension],
+        env: Dict[str, Any],
+        key_node: ast.AST,
+        value_node: ast.AST,
+    ) -> Any:
+        yield from self._iterate_comprehension(generators, env, value_node, key_node)
+
+    def _iterate_comprehension(
+        self,
+        generators: List[ast.comprehension],
+        env: Dict[str, Any],
+        value_node: ast.AST,
+        key_node: Optional[ast.AST],
+    ):
+        def recurse(index: int, current_env: Dict[str, Any]):
+            if index == len(generators):
+                if key_node is None:
+                    yield self._eval_node(value_node, current_env)
+                else:
+                    yield (
+                        self._eval_node(key_node, current_env),
+                        self._eval_node(value_node, current_env),
+                    )
+                return
+
+            comp = generators[index]
+            iterable = self._eval_node(comp.iter, current_env)
+            for item in iterable:
+                new_env = dict(current_env)
+                self._assign_comprehension_target(new_env, comp.target, item)
+                if all(bool(self._eval_node(condition, new_env)) for condition in comp.ifs):
+                    yield from recurse(index + 1, new_env)
+
+        yield from recurse(0, dict(env))
+
+    def _assign_comprehension_target(self, env: Dict[str, Any], target: ast.AST, value: Any) -> None:
+        if isinstance(target, ast.Name):
+            env[target.id] = value
+            return
+        if isinstance(target, (ast.Tuple, ast.List)):
+            values = list(value) if not isinstance(value, (list, tuple)) else value
+            if len(target.elts) != len(values):
+                raise ExpressionEvalError("comprehension target length mismatch")
+            for subtarget, subvalue in zip(target.elts, values):
+                self._assign_comprehension_target(env, subtarget, subvalue)
+            return
+        raise ExpressionEvalError("unsupported comprehension target")
 
 
 class RuleEngine:
@@ -537,6 +818,7 @@ class RuleEngine:
         self._unknown_scope_reported: Set[str] = set()
         self._dsl_notice_emitted: bool = False
         self._expr_error_reported: Set[Tuple[str, str, str]] = set()
+        self._expr_interpreter = _SafeExpressionInterpreter()
 
     def evaluate(self) -> List[Violation]:
         """
@@ -654,14 +936,26 @@ class RuleEngine:
         return bindings, predicate
 
     def _create_base_env(self) -> Dict[str, Any]:
-        return {
-            "project": self.project_db,
-            "project_db": self.project_db,
-            "functions_by_name": self.project_db.functions_by_name,
-            "globals_by_name": self.project_db.globals_by_name,
-            "call_edge": self._call_edge_helper,
-            "calls_function": self._calls_function_helper,
-        }
+        env: Dict[str, Any] = dict(_SAFE_BASE_CALLABLES)
+        env.update(
+            {
+                "project": self.project_db,
+                "project_db": self.project_db,
+                "functions_by_name": self.project_db.functions_by_name,
+                "globals_by_name": self.project_db.globals_by_name,
+                "call_edge": self._make_env_callable(self._call_edge_helper),
+                "calls_function": self._make_env_callable(self._calls_function_helper),
+                "call_path_exists": self._make_env_callable(self._call_path_helper),
+            }
+        )
+        return env
+
+    def _make_env_callable(self, func: Any) -> Any:
+        @functools.wraps(func)
+        def _wrapper(*args: Any, **kwargs: Any) -> Any:
+            return func(*args, **kwargs)
+
+        return _mark_safe_callable(_wrapper)
 
     def _assign_alias(self, env: Dict[str, Any], alias: str, node: Any, *, primary: bool = False) -> None:
         env[alias] = node
@@ -746,6 +1040,27 @@ class RuleEngine:
                 return True
         return False
 
+    def _call_path_helper(self, caller: Any, callee: Any, max_depth: int = 64) -> bool:
+        start = self._extract_symbol_name(caller)
+        target = self._extract_symbol_name(callee)
+        if not start or not target:
+            return False
+        if start == target:
+            return True
+        visited = set([start])
+        queue: deque[Tuple[str, int]] = deque([(start, 0)])
+        while queue:
+            symbol, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            for neighbor in self.project_db.call_graph.get(symbol, set()):
+                if neighbor == target:
+                    return True
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, depth + 1))
+        return False
+
     def _extract_symbol_name(self, obj: Any) -> Optional[str]:
         if obj is None:
             return None
@@ -765,8 +1080,11 @@ class RuleEngine:
         if not expr:
             return True
         try:
-            return eval(expr, SAFE_EVAL_GLOBALS, env)
-        except Exception as exc:
+            return self._expr_interpreter.evaluate(expr, env)
+        except ExpressionEvalError as exc:
+            self._report_eval_error(rule, stage, expr, exc)
+            return False if stage in {"select", "assert", "exception"} else ""
+        except Exception as exc:  # pragma: no cover - safeguard
             self._report_eval_error(rule, stage, expr, exc)
             return False if stage in {"select", "assert", "exception"} else ""
 
@@ -1322,6 +1640,95 @@ def _collect_ir_nodes(
             callsite = _callsite_from_cursor(cursor, canonical_main)
             if callsite:
                 current_function.calls.append(callsite)
+                _append_call_to_cfg(current_function, callsite)
+        elif cursor.kind == clang_cindex.CursorKind.IF_STMT and current_function is not None:
+            if_stmt = _if_stmt_from_cursor(cursor, canonical_main, current_function.name)
+            current_function.if_stmts.append(if_stmt)
+            condition_block = _record_basic_block(
+                current_function,
+                f"If: {if_stmt.condition}",
+                cursor,
+                canonical_main,
+                enclosing_construct="if_stmt",
+                branch_condition=if_stmt.condition,
+            )
+            then_child = _find_child_of_kind(cursor, clang_cindex.CursorKind.COMPOUND_STMT, occurrence=0)
+            else_child = _find_child_of_kind(cursor, clang_cindex.CursorKind.COMPOUND_STMT, occurrence=1)
+            else_if_child = None
+            if else_child is None:
+                else_if_child = _find_child_of_kind(cursor, clang_cindex.CursorKind.IF_STMT, occurrence=0)
+            branch_children: List["clang_cindex.Cursor"] = []
+            if then_child is not None:
+                branch_children.append(then_child)
+            if else_child is not None:
+                branch_children.append(else_child)
+            elif else_if_child is not None:
+                branch_children.append(else_if_child)
+
+            branch_exit_blocks: List[int] = []
+            if branch_children:
+                for child in branch_children:
+                    with _push_pending_predecessors(current_function, [condition_block.block_id]):
+                        visit(child, next_function)
+                        exit_id = _current_block_id(current_function)
+                        if exit_id is not None:
+                            branch_exit_blocks.append(exit_id)
+            else:
+                branch_exit_blocks.append(condition_block.block_id)
+
+            if else_child is None and else_if_child is None and condition_block.block_id not in branch_exit_blocks:
+                branch_exit_blocks.append(condition_block.block_id)
+
+            _set_pending_predecessors(current_function, branch_exit_blocks or [condition_block.block_id])
+        elif cursor.kind in (
+            clang_cindex.CursorKind.FOR_STMT,
+            clang_cindex.CursorKind.WHILE_STMT,
+            clang_cindex.CursorKind.DO_STMT,
+        ) and current_function is not None:
+            loop_stmt = _loop_stmt_from_cursor(cursor, canonical_main, current_function.name)
+            current_function.loops.append(loop_stmt)
+            loop_block = _record_basic_block(
+                current_function,
+                f"Loop: {loop_stmt.kind}",
+                cursor,
+                canonical_main,
+                enclosing_construct="loop_stmt",
+                branch_condition=loop_stmt.condition,
+            )
+            body_child = _find_child_of_kind(cursor, clang_cindex.CursorKind.COMPOUND_STMT, occurrence=0) or cursor
+            with _push_pending_predecessors(current_function, [loop_block.block_id]):
+                visit(body_child, next_function)
+                exit_id = _current_block_id(current_function)
+                if exit_id is not None:
+                    _connect_blocks(current_function, exit_id, loop_block.block_id)
+            _set_pending_predecessors(current_function, [loop_block.block_id])
+        elif cursor.kind == clang_cindex.CursorKind.SWITCH_STMT and current_function is not None:
+            switch_stmt = _switch_stmt_from_cursor(cursor, canonical_main, current_function.name)
+            current_function.switches.append(switch_stmt)
+            switch_block = _record_basic_block(
+                current_function,
+                "switch",
+                cursor,
+                canonical_main,
+                enclosing_construct="switch_stmt",
+                branch_condition=switch_stmt.control_expr,
+            )
+            case_children = [
+                child
+                for child in cursor.get_children()
+                if child.kind in (clang_cindex.CursorKind.CASE_STMT, clang_cindex.CursorKind.DEFAULT_STMT)
+            ]
+            case_exits: List[int] = []
+            if case_children:
+                for case_child in case_children:
+                    with _push_pending_predecessors(current_function, [switch_block.block_id]):
+                        visit(case_child, next_function)
+                        exit_id = _current_block_id(current_function)
+                        if exit_id is not None:
+                            case_exits.append(exit_id)
+            else:
+                case_exits.append(switch_block.block_id)
+            _set_pending_predecessors(current_function, case_exits or [switch_block.block_id])
 
         try:
             children = list(cursor.get_children())
@@ -1446,6 +1853,7 @@ def _function_from_cursor(
         prefix=None,
         suffix=None,
     )
+    _initialize_function_cfg(function)
     return function
 
 
@@ -1694,6 +2102,261 @@ def _type_decl_from_cursor(
     return type_decl
 
 
+def _initialize_function_cfg(function: Function) -> None:
+    if function.cfg.blocks:
+        return
+    entry_block = BasicBlock(
+        block_id=0,
+        statements=["entry"],
+        successors=[],
+        predecessors=[],
+        source_range=function.source_range,
+        preprocessor=function.preprocessor,
+    )
+    function.cfg.blocks[0] = entry_block
+    function.cfg.entry_block = 0
+    function.cfg.exit_blocks = [0]
+    function.exit_points = [0]
+    setattr(function, "_cfg_state", {"next_block_id": 1, "current_block_id": 0})
+
+
+def _get_cfg_state(function: Function) -> Dict[str, Any]:
+    state = getattr(function, "_cfg_state", None)
+    if state is None:
+        state = {"next_block_id": len(function.cfg.blocks) or 1, "current_block_id": function.cfg.entry_block or 0}
+        setattr(function, "_cfg_state", state)
+    return state
+
+
+def _current_block_id(function: Function) -> Optional[int]:
+    state = _get_cfg_state(function)
+    return state.get("current_block_id")
+
+
+def _set_pending_predecessors(function: Function, preds: List[int]) -> None:
+    state = _get_cfg_state(function)
+    state["pending_predecessors"] = list(preds)
+
+
+@contextmanager
+def _push_pending_predecessors(function: Function, preds: List[int]):
+    state = _get_cfg_state(function)
+    previous = list(state.get("pending_predecessors", []))
+    state["pending_predecessors"] = list(preds)
+    try:
+        yield
+    finally:
+        state["pending_predecessors"] = previous
+
+
+def _connect_blocks(function: Function, from_block_id: Optional[int], to_block_id: Optional[int]) -> None:
+    if from_block_id is None or to_block_id is None:
+        return
+    from_block = function.cfg.blocks.get(from_block_id)
+    to_block = function.cfg.blocks.get(to_block_id)
+    if from_block is None or to_block is None:
+        return
+    if to_block_id not in from_block.successors:
+        from_block.successors.append(to_block_id)
+    if from_block_id not in to_block.predecessors:
+        to_block.predecessors.append(from_block_id)
+
+
+def _record_basic_block(
+    function: Function,
+    description: str,
+    cursor: "clang_cindex.Cursor",
+    canonical_main: str,
+    *,
+    enclosing_construct: Optional[str] = None,
+    branch_condition: Optional[str] = None,
+) -> BasicBlock:
+    state = _get_cfg_state(function)
+    block_id = state["next_block_id"]
+    state["next_block_id"] += 1
+
+    block = BasicBlock(
+        block_id=block_id,
+        statements=[description],
+        enclosing_construct=enclosing_construct,
+        branch_condition=branch_condition,
+        source_range=_make_source_range(cursor.extent, canonical_main),
+        preprocessor=PreprocessorContext(),
+    )
+
+    pending = state.get("pending_predecessors", [])
+    if pending:
+        predecessor_ids = list(pending)
+    else:
+        current_block_id = state.get("current_block_id")
+        predecessor_ids = [current_block_id] if current_block_id is not None else []
+
+    for pred_id in predecessor_ids:
+        prev_block = function.cfg.blocks.get(pred_id)
+        if prev_block is not None:
+            if block_id not in prev_block.successors:
+                prev_block.successors.append(block_id)
+            if prev_block.block_id not in block.predecessors:
+                block.predecessors.append(prev_block.block_id)
+
+    state["pending_predecessors"] = []
+
+    function.cfg.blocks[block_id] = block
+    function.cfg.exit_blocks = [block_id]
+    function.exit_points = [block_id]
+    state["current_block_id"] = block_id
+    return block
+
+
+def _append_call_to_cfg(function: Function, callsite: CallSite) -> None:
+    block = _current_block(function)
+    if block is None:
+        return
+    block.calls.append(callsite)
+    if block.source_range is None:
+        block.source_range = callsite.location
+
+
+def _current_block(function: Function) -> Optional[BasicBlock]:
+    state = _get_cfg_state(function)
+    block_id = state.get("current_block_id")
+    if block_id is None:
+        return None
+    return function.cfg.blocks.get(block_id)
+
+
+def _if_stmt_from_cursor(
+    cursor: "clang_cindex.Cursor",
+    canonical_main: str,
+    function_name: str,
+) -> IfStmt:
+    condition = _cursor_condition_text(cursor)
+    then_child = _find_child_of_kind(cursor, clang_cindex.CursorKind.COMPOUND_STMT, occurrence=0)
+    else_child = _find_child_of_kind(cursor, clang_cindex.CursorKind.COMPOUND_STMT, occurrence=1)
+    else_if_child = None
+    if else_child is None:
+        else_if_child = _find_child_of_kind(cursor, clang_cindex.CursorKind.IF_STMT, occurrence=0)
+
+    then_block = _block_stmt_from_cursor(then_child or cursor, canonical_main)
+    else_block_stmt = None
+    if else_child is not None or else_if_child is not None:
+        else_block_stmt = _block_stmt_from_cursor((else_child or else_if_child) or cursor, canonical_main)
+
+    return IfStmt(
+        condition=condition,
+        then_block=then_block,
+        else_block=else_block_stmt,
+        parent_function=function_name,
+        source_range=_make_source_range(cursor.extent, canonical_main),
+        preprocessor=PreprocessorContext(),
+        annotations=[],
+    )
+
+
+def _loop_stmt_from_cursor(
+    cursor: "clang_cindex.Cursor",
+    canonical_main: str,
+    function_name: str,
+) -> LoopStmt:
+    if cursor.kind == clang_cindex.CursorKind.FOR_STMT:
+        loop_kind: Literal["for", "while", "do_while"] = "for"
+    elif cursor.kind == clang_cindex.CursorKind.WHILE_STMT:
+        loop_kind = "while"
+    else:
+        loop_kind = "do_while"
+
+    body_child = _find_child_of_kind(cursor, clang_cindex.CursorKind.COMPOUND_STMT, occurrence=0)
+    loop_body = _block_stmt_from_cursor(body_child or cursor, canonical_main)
+
+    return LoopStmt(
+        kind=loop_kind,
+        condition=_cursor_condition_text(cursor),
+        body=loop_body,
+        parent_function=function_name,
+        source_range=_make_source_range(cursor.extent, canonical_main),
+        preprocessor=PreprocessorContext(),
+        annotations=[],
+    )
+
+
+def _switch_stmt_from_cursor(
+    cursor: "clang_cindex.Cursor",
+    canonical_main: str,
+    function_name: str,
+) -> SwitchStmt:
+    cases: List[SwitchCaseBlock] = []
+    has_default = False
+
+    for child in cursor.get_children():
+        if child.kind == clang_cindex.CursorKind.CASE_STMT:
+            labels = [_cursor_condition_text(child)]
+            body_child = _find_child_of_kind(child, clang_cindex.CursorKind.COMPOUND_STMT, occurrence=0)
+            cases.append(
+                SwitchCaseBlock(
+                    labels=labels,
+                    body=_block_stmt_from_cursor(body_child or child, canonical_main),
+                    source_range=_make_source_range(child.extent, canonical_main),
+                )
+            )
+        elif child.kind == clang_cindex.CursorKind.DEFAULT_STMT:
+            has_default = True
+            body_child = _find_child_of_kind(child, clang_cindex.CursorKind.COMPOUND_STMT, occurrence=0)
+            cases.append(
+                SwitchCaseBlock(
+                    labels=["default"],
+                    body=_block_stmt_from_cursor(body_child or child, canonical_main),
+                    source_range=_make_source_range(child.extent, canonical_main),
+                )
+            )
+
+    return SwitchStmt(
+        control_expr=_cursor_condition_text(cursor),
+        cases=cases,
+        has_default=has_default,
+        parent_function=function_name,
+        source_range=_make_source_range(cursor.extent, canonical_main),
+        preprocessor=PreprocessorContext(),
+        annotations=[],
+    )
+
+
+def _block_stmt_from_cursor(
+    cursor: Optional["clang_cindex.Cursor"],
+    canonical_main: str,
+) -> BlockStmt:
+    if cursor is None:
+        return BlockStmt(statements=[], source_range=None, preprocessor=PreprocessorContext())
+    description = cursor.displayname or cursor.spelling or cursor.kind.name
+    return BlockStmt(
+        statements=[description] if description else [],
+        source_range=_make_source_range(cursor.extent, canonical_main),
+        preprocessor=PreprocessorContext(),
+    )
+
+
+def _find_child_of_kind(
+    cursor: "clang_cindex.Cursor",
+    kind: "clang_cindex.CursorKind",
+    *,
+    occurrence: int = 0,
+) -> Optional["clang_cindex.Cursor"]:
+    matches = [child for child in cursor.get_children() if child.kind == kind]
+    if len(matches) > occurrence:
+        return matches[occurrence]
+    return None
+
+
+def _cursor_condition_text(cursor: "clang_cindex.Cursor") -> str:
+    text = cursor.displayname or cursor.spelling
+    if text:
+        return text
+    try:
+        tokens = [t.spelling for t in cursor.get_tokens()]
+        if tokens:
+            return " ".join(tokens[:32])
+    except Exception:
+        pass
+    return "<expr>"
 def _type_is_const(ctype: Optional["clang_cindex.Type"]) -> bool:
     if ctype is None:
         return False
