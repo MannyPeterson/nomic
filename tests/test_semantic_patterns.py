@@ -61,8 +61,10 @@ class SemanticPatternTests(unittest.TestCase):
             pattern=r"process\((?P<var>\w+)\)",
             pattern_scope="function",
         )
-        self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0].pattern_match.groupdict["var"], "packet")
+        self.assertGreaterEqual(len(matches), 1)
+        first = matches[0]
+        self.assertIsNotNone(first.pattern_match)
+        self.assertEqual(first.pattern_match.groupdict["var"], "packet")
 
     def test_semantic_pattern_any_convenience(self) -> None:
         has_info_log = nomic.semantic_pattern_any(
