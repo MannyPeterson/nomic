@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Nomic - Semantic Rule Enforcement for C
+@file nomic.py
+@author Manny Peterson
+@brief Nomic C code semantic analsysis tool.
+@version 0.5.0
+@date 2025-10-25
 
-High-level goals:
-- Parse C (via Clang) into a rich IR (AST, CFG, symbols, macros, etc.)
-- Load declarative rules from YAML
-- Evaluate rules against IR + project-wide context
-- Emit rich structured JSON for CI / IDEs
+@copyright
+Nomic C Code Analysis Copyright (C) 2025-2026 Manny Peterson
 
-This file is intentionally single-module so you can iterate quickly in VS Code / Codex.
-Later, you can split it into packages.
+    SPDX-License-Identifier: GPL-2.0-or-later
+
 """
 
 from __future__ import annotations
