@@ -536,7 +536,7 @@ class RuleEngine:
         self._unknown_scopes: Set[str] = set()
         self._unknown_scope_reported: Set[str] = set()
         self._dsl_notice_emitted: bool = False
-        self._expr_error_reported: Set[Tuple[str, str]] = set()
+        self._expr_error_reported: Set[Tuple[str, str, str]] = set()
 
     def evaluate(self) -> List[Violation]:
         """
@@ -548,87 +548,210 @@ class RuleEngine:
         for rule in self.rules:
             nodes, recognized = self._collect_scope_objects(rule.scope)
             if not recognized:
-                self._maybe_report_unknown_scope(rule)
+                self._maybe_report_unknown_scope(rule, rule.scope)
                 continue
 
             if not nodes:
                 continue
 
             self._notify_dsl_unimplemented(rule)
-            alias, predicate = self._parse_select(rule.select, rule.scope)
+            bindings, predicate = self._parse_select(rule.select, rule.scope)
+            primary_alias, primary_scope = bindings[0]
+
+            if primary_scope != rule.scope:
+                nodes, recognized = self._collect_scope_objects(primary_scope)
+                if not recognized:
+                    self._maybe_report_unknown_scope(rule, primary_scope)
+                    continue
+
+            if not nodes:
+                continue
+
             assert_expr = (rule.assert_code or "").strip()
             exception_exprs = [expr.strip() for expr in rule.exceptions if expr.strip()]
 
-            for node in nodes:
-                env = self._build_env(alias, node)
+            binding_objects: List[List[Any]] = []
+            binding_objects.append(nodes)
 
-                if not self._evaluate_expression(predicate, env, rule, stage="select"):
-                    continue
+            scopes_valid = True
+            for _, scope_name in bindings[1:]:
+                objs, recognized = self._collect_scope_objects(scope_name)
+                if not recognized:
+                    self._maybe_report_unknown_scope(rule, scope_name)
+                    scopes_valid = False
+                    break
+                binding_objects.append(objs)
 
-                result = self._evaluate_expression(assert_expr or "True", env, rule, stage="assert")
-                if result:
-                    continue
+            if not scopes_valid:
+                continue
 
-                exception_triggered = False
-                for exception_expr in exception_exprs:
-                    if self._evaluate_expression(exception_expr, env, rule, stage="exception"):
-                        exception_triggered = True
-                        break
-                if exception_triggered:
-                    continue
+            if any(len(obj_list) == 0 for obj_list in binding_objects):
+                continue
 
-                violations.append(self._build_violation(rule, env, node))
+            for primary_obj in binding_objects[0]:
+                env = self._create_base_env()
+                self._assign_alias(env, primary_alias, primary_obj, primary=True)
+                self._evaluate_binding_combinations(
+                    rule=rule,
+                    bindings=bindings,
+                    binding_objects=binding_objects,
+                    predicate=predicate,
+                    assert_expr=assert_expr,
+                    exception_exprs=exception_exprs,
+                    env=env,
+                    violations=violations,
+                    start_index=1,
+                    primary_node=primary_obj,
+                )
 
         return violations
 
-    def _parse_select(self, select_expr: Optional[str], scope: str) -> Tuple[str, str]:
+    def _parse_select(self, select_expr: Optional[str], scope: str) -> Tuple[List[Tuple[str, str]], str]:
         """
-        Extract (alias, predicate_expression) from the rule's select block.
+        Extract (bindings, predicate_expression) from the rule's select block.
         Supported forms:
           - "alias: Scope where expr"
           - "alias: Scope"
+          - "alias1: Scope1, alias2: Scope2 where expr"
           - "where expr"
           - plain expression (defaults alias -> obj)
           - empty/None => predicate True
         """
         if not select_expr:
-            return "obj", "True"
+            return [("obj", scope)], "True"
 
         text = select_expr.strip()
         if not text:
-            return "obj", "True"
-
-        alias = "obj"
-        remainder = text
-
-        if ":" in text:
-            alias_part, rest = text.split(":", 1)
-            alias = alias_part.strip() or "obj"
-            remainder = rest.strip()
-
-        # Trim leading scope token if present (e.g. "Function where ...").
-        if remainder:
-            parts = remainder.split(None, 1)
-            if parts and parts[0] == scope:
-                remainder = parts[1] if len(parts) > 1 else ""
+            return [("obj", scope)], "True"
 
         predicate = "True"
-        lower = remainder.lower()
+        select_part = text
+        lower = text.lower()
         if lower.startswith("where "):
-            predicate = remainder[6:].strip() or "True"
+            predicate = text[6:].strip() or "True"
+            select_part = ""
         else:
             where_idx = lower.find(" where ")
             if where_idx != -1:
-                predicate = remainder[where_idx + len(" where "):].strip() or "True"
-            elif remainder:
-                predicate = remainder
+                predicate = text[where_idx + len(" where "):].strip() or "True"
+                select_part = text[:where_idx].strip()
 
-        return alias, predicate
+        binding_specs = [spec.strip() for spec in select_part.split(",") if spec.strip()]
+        bindings: List[Tuple[str, str]] = []
+        if not binding_specs:
+            bindings.append(("obj", scope))
+        else:
+            for idx, spec in enumerate(binding_specs):
+                if ":" in spec:
+                    alias_part, scope_part = spec.split(":", 1)
+                    alias_name = alias_part.strip() or f"obj{idx}"
+                    scope_name = scope_part.strip() or scope
+                else:
+                    alias_name = spec.strip() or f"obj{idx}"
+                    scope_name = scope
+                bindings.append((alias_name, scope_name))
 
-    def _build_env(self, alias: str, node: Any) -> Dict[str, Any]:
-        env = {alias: node, "obj": node}
-        env["_scope_name"] = getattr(node, "name", None)
-        return env
+        return bindings, predicate
+
+    def _create_base_env(self) -> Dict[str, Any]:
+        return {
+            "project": self.project_db,
+            "project_db": self.project_db,
+            "functions_by_name": self.project_db.functions_by_name,
+            "globals_by_name": self.project_db.globals_by_name,
+            "call_edge": self._call_edge_helper,
+            "calls_function": self._calls_function_helper,
+        }
+
+    def _assign_alias(self, env: Dict[str, Any], alias: str, node: Any, *, primary: bool = False) -> None:
+        env[alias] = node
+        if primary:
+            env["obj"] = node
+            env["_scope_name"] = getattr(node, "name", None)
+
+    def _evaluate_binding_combinations(
+        self,
+        *,
+        rule: Rule,
+        bindings: List[Tuple[str, str]],
+        binding_objects: List[List[Any]],
+        predicate: str,
+        assert_expr: str,
+        exception_exprs: List[str],
+        env: Dict[str, Any],
+        violations: List[Violation],
+        start_index: int,
+        primary_node: Any,
+    ) -> None:
+        def recurse(index: int, current_env: Dict[str, Any]) -> None:
+            if index == len(bindings):
+                self._evaluate_rule_conditions(
+                    rule=rule,
+                    env=current_env,
+                    predicate=predicate,
+                    assert_expr=assert_expr,
+                    exception_exprs=exception_exprs,
+                    violations=violations,
+                    node=primary_node,
+                )
+                return
+
+            alias, _ = bindings[index]
+            for obj in binding_objects[index]:
+                next_env = dict(current_env)
+                self._assign_alias(next_env, alias, obj, primary=False)
+                recurse(index + 1, next_env)
+
+        recurse(start_index, env)
+
+    def _evaluate_rule_conditions(
+        self,
+        *,
+        rule: Rule,
+        env: Dict[str, Any],
+        predicate: str,
+        assert_expr: str,
+        exception_exprs: List[str],
+        violations: List[Violation],
+        node: Any,
+    ) -> None:
+        if not self._evaluate_expression(predicate or "True", env, rule, stage="select"):
+            return
+
+        result = self._evaluate_expression(assert_expr or "True", env, rule, stage="assert")
+        if result:
+            return
+
+        for exception_expr in exception_exprs:
+            if self._evaluate_expression(exception_expr, env, rule, stage="exception"):
+                return
+
+        violations.append(self._build_violation(rule, env, node))
+
+    def _call_edge_helper(self, caller: Any, callee: Any) -> bool:
+        caller_name = self._extract_symbol_name(caller)
+        callee_name = self._extract_symbol_name(callee)
+        if not caller_name or not callee_name:
+            return False
+        return callee_name in self.project_db.call_graph.get(caller_name, set())
+
+    def _calls_function_helper(self, function_obj: Any, callee: Any) -> bool:
+        if not isinstance(function_obj, Function):
+            return False
+        target = self._extract_symbol_name(callee)
+        if not target:
+            return False
+        for call in function_obj.calls:
+            if target and target in {call.callee_symbol, call.callee_name}:
+                return True
+        return False
+
+    def _extract_symbol_name(self, obj: Any) -> Optional[str]:
+        if obj is None:
+            return None
+        if isinstance(obj, str):
+            return obj
+        return getattr(obj, "name", None)
 
     def _eval_raw_expression(
         self,
@@ -859,17 +982,18 @@ class RuleEngine:
         self._scope_cache[scope] = objects
         return objects, known
 
-    def _maybe_report_unknown_scope(self, rule: Rule) -> None:
+    def _maybe_report_unknown_scope(self, rule: Rule, scope_name: Optional[str] = None) -> None:
         """
         Emit a single warning per unknown scope to help authors debug rules.
         """
-        if rule.scope in self._unknown_scope_reported:
+        scope = scope_name or rule.scope
+        if scope in self._unknown_scope_reported:
             return
 
         sys.stderr.write(
-            f"[nomic] Unknown rule scope '{rule.scope}' referenced by rule '{rule.id}'.\n"
+            f"[nomic] Unknown rule scope '{scope}' referenced by rule '{rule.id}'.\n"
         )
-        self._unknown_scope_reported.add(rule.scope)
+        self._unknown_scope_reported.add(scope)
 
     def _notify_dsl_unimplemented(self, rule: Rule, emitted: bool = True) -> None:
         """
@@ -1163,27 +1287,18 @@ def _collect_ir_nodes(
     macros: List[MacroDefinition] = []
     types: List[TypeDecl] = []
 
-    stack = [clang_tu.cursor]
-    seen_hashes: Set[int] = set()
-
-    while stack:
-        cursor = stack.pop()
-        try:
-            cursor_hash = cursor.hash
-        except AttributeError:
-            cursor_hash = None
-        if cursor_hash is not None:
-            if cursor_hash in seen_hashes:
-                continue
-            seen_hashes.add(cursor_hash)
-
-        # Always traverse the TU root even if it has no location.
+    def visit(cursor: "clang_cindex.Cursor", current_function: Optional[Function]) -> None:
+        # Always traverse the TU root even if it has no explicit location.
         if cursor.kind != clang_cindex.CursorKind.TRANSLATION_UNIT:
             if not _cursor_in_main_file(cursor, canonical_main):
-                continue
+                return
+
+        next_function = current_function
 
         if cursor.kind == clang_cindex.CursorKind.FUNCTION_DECL and cursor.is_definition():
-            functions.append(_function_from_cursor(cursor, canonical_main))
+            fn = _function_from_cursor(cursor, canonical_main)
+            functions.append(fn)
+            next_function = fn
         elif (
             cursor.kind == clang_cindex.CursorKind.VAR_DECL
             and cursor.semantic_parent
@@ -1203,12 +1318,19 @@ def _collect_ir_nodes(
             type_decl = _type_decl_from_cursor(cursor, canonical_main)
             if type_decl:
                 types.append(type_decl)
+        elif cursor.kind == clang_cindex.CursorKind.CALL_EXPR and current_function is not None:
+            callsite = _callsite_from_cursor(cursor, canonical_main)
+            if callsite:
+                current_function.calls.append(callsite)
 
         try:
-            stack.extend(list(cursor.get_children()))
+            children = list(cursor.get_children())
         except Exception:
-            continue
+            children = []
+        for child in children:
+            visit(child, next_function)
 
+    visit(clang_tu.cursor, None)
     return functions, globals_list, macros, types
 
 
@@ -1271,11 +1393,15 @@ def _storage_class_to_variable_storage(
 def _linkage_to_string(linkage: "clang_cindex.LinkageKind") -> str:
     if clang_cindex is None:
         return "external"
-    if linkage == clang_cindex.LinkageKind.INTERNAL:
+    kind = linkage
+    lk = clang_cindex.LinkageKind
+    none_kind = getattr(lk, "NONE", getattr(lk, "NO_LINKAGE", None))
+    unique_external = getattr(lk, "UNIQUE_EXTERNAL", None)
+    if kind == lk.INTERNAL:
         return "internal"
-    if linkage == clang_cindex.LinkageKind.UNIQUE_EXTERNAL:
+    if unique_external is not None and kind == unique_external:
         return "internal"
-    if linkage == clang_cindex.LinkageKind.NONE:
+    if none_kind is not None and kind == none_kind:
         return "none"
     return "external"
 
@@ -1336,9 +1462,9 @@ def _param_variable_from_cursor(
         ctype=cursor.type.spelling if cursor.type else "",
         storage="auto",
         linkage="none",
-        is_const=bool(cursor.type and cursor.type.is_const_qualified()),
-        is_volatile=bool(cursor.type and cursor.type.is_volatile_qualified()),
-        is_atomic=bool(cursor.type and cursor.type.is_atomic_qualified()),
+        is_const=_type_is_const(cursor.type),
+        is_volatile=_type_is_volatile(cursor.type),
+        is_atomic=_type_is_atomic(cursor.type),
         scope="param",
         decl_function=function_name,
         prefix=None,
@@ -1363,9 +1489,9 @@ def _global_from_cursor(
         ctype=cursor.type.spelling if cursor.type else "",
         storage=storage,
         linkage=linkage,
-        is_const=bool(cursor.type and cursor.type.is_const_qualified()),
-        is_volatile=bool(cursor.type and cursor.type.is_volatile_qualified()),
-        is_atomic=bool(cursor.type and cursor.type.is_atomic_qualified()),
+        is_const=_type_is_const(cursor.type),
+        is_volatile=_type_is_volatile(cursor.type),
+        is_atomic=_type_is_atomic(cursor.type),
         scope="file",
         decl_function=None,
         prefix=None,
@@ -1441,6 +1567,47 @@ def _macro_from_cursor(
         annotations=[],
         prefix=None,
         suffix=None,
+    )
+
+
+def _callsite_from_cursor(
+    cursor: "clang_cindex.Cursor",
+    canonical_main: str,
+) -> Optional[CallSite]:
+    callee_name = cursor.displayname or cursor.spelling
+    callee_symbol = None
+    referenced = getattr(cursor, "referenced", None)
+    if referenced is not None:
+        callee_symbol = referenced.spelling or referenced.displayname
+        if not callee_name:
+            callee_name = callee_symbol
+
+    args: List[str] = []
+    arg_getter = getattr(cursor, "get_arguments", None)
+    if arg_getter is not None:
+        try:
+            for arg in arg_getter():
+                args.append(arg.displayname or arg.spelling or "")
+        except Exception:
+            pass
+
+    if not callee_name:
+        callee_name = "<unknown>"
+
+    return CallSite(
+        callee_name=callee_name,
+        callee_symbol=callee_symbol,
+        args=args,
+        location=_make_source_range(cursor.extent, canonical_main),
+        in_branch=None,
+        in_loop=None,
+        in_switch=False,
+        in_macro_expansion=False,
+        is_blocking_api=False,
+        is_allocator=False,
+        is_lock=False,
+        is_unlock=False,
+        preprocessor=PreprocessorContext(),
     )
 
 
@@ -1525,6 +1692,42 @@ def _type_decl_from_cursor(
         annotations=[],
     )
     return type_decl
+
+
+def _type_is_const(ctype: Optional["clang_cindex.Type"]) -> bool:
+    if ctype is None:
+        return False
+    checker = getattr(ctype, "is_const_qualified", None)
+    if checker is None:
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+def _type_is_volatile(ctype: Optional["clang_cindex.Type"]) -> bool:
+    if ctype is None:
+        return False
+    checker = getattr(ctype, "is_volatile_qualified", None)
+    if checker is None:
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+def _type_is_atomic(ctype: Optional["clang_cindex.Type"]) -> bool:
+    if ctype is None:
+        return False
+    checker = getattr(ctype, "is_atomic_qualified", None)
+    if checker is None:
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
 
 
 # ============================================================
