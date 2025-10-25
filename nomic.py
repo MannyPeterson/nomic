@@ -345,13 +345,13 @@ class Function:
     local_vars: List[Variable] = field(default_factory=list)
 
     linkage: Literal["internal", "external"] = "external"  # static => internal
-    storage: Optional[str] = None  # "static", "extern", etc.
+    storage_class: Optional[str] = None  # "static", "extern", etc.
 
     attributes: List[str] = field(default_factory=list)  # compiler attrs like interrupt, naked
     annotations: List[Annotation] = field(default_factory=list)
 
-    is_isr: bool = False
-    is_inline: bool = False
+    inline_hint: bool = False
+    isr_hint: bool = False
 
     calls: List[CallSite] = field(default_factory=list)
     cfg: ControlFlowGraph = field(default_factory=ControlFlowGraph)
@@ -370,6 +370,50 @@ class Function:
     # For naming rules
     prefix: Optional[str] = None
     suffix: Optional[str] = None
+
+    cyclomatic_complexity: int = 1
+    cognitive_complexity: int = 0
+    nesting_depth: int = 0
+
+    @property
+    def storage(self) -> Optional[str]:
+        """Backwards-compatible alias for storage_class."""
+        return self.storage_class
+
+    @storage.setter
+    def storage(self, value: Optional[str]) -> None:
+        self.storage_class = value
+
+    @property
+    def is_static(self) -> bool:
+        return self.storage_class == "static"
+
+    @property
+    def is_inline(self) -> bool:
+        return self.storage_class == "inline" or self.inline_hint
+
+    @property
+    def is_extern(self) -> bool:
+        if self.storage_class == "extern":
+            return True
+        return self.storage_class is None and self.linkage == "external" and not self.is_static
+
+    @property
+    def is_isr(self) -> bool:
+        if self.isr_hint:
+            return True
+        name = (self.name or "").lower()
+        if "isr" in name or name.endswith("_handler") or name.endswith("handler"):
+            return True
+        for attr in self.attributes:
+            lowered = attr.lower()
+            if any(token in lowered for token in ("interrupt", "isr", "irq")):
+                return True
+        return False
+
+    @is_isr.setter
+    def is_isr(self, value: bool) -> None:
+        self.isr_hint = value
 
 
 # ============================================================
@@ -588,7 +632,11 @@ def _forall_helper(iterable: Any) -> bool:
 
 
 def _count_helper(iterable: Any) -> int:
-    return sum(1 for _ in iterable)
+    return sum(1 for item in iterable if item)
+
+
+def _implies_helper(left: Any, right: Any) -> bool:
+    return (not bool(left)) or bool(right)
 
 
 _SAFE_BASE_CALLABLES: Dict[str, Any] = {
@@ -603,6 +651,8 @@ _SAFE_BASE_CALLABLES: Dict[str, Any] = {
     "exists": _wrap_safe_callable(_exists_helper),
     "forall": _wrap_safe_callable(_forall_helper),
     "count": _wrap_safe_callable(_count_helper),
+    "_nomic_implies": _wrap_safe_callable(_implies_helper),
+    "implies": _wrap_safe_callable(_implies_helper),
 }
 
 TEMPLATE_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
@@ -610,6 +660,131 @@ TEMPLATE_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 
 class ExpressionEvalError(Exception):
     """Raised when the DSL expression evaluator encounters an unsafe or invalid construct."""
+
+
+_IMPLIES_KEYWORD = "implies"
+_BRACKET_PAIRS = {"(": ")", "[": "]", "{": "}"}
+
+
+def _rewrite_implies_expression(expr: str) -> str:
+    """
+    Transform infix 'implies' operators into calls to the safe helper.
+    The DSL allows expressions like `a implies b`, which we desugar into
+    `_nomic_implies(a, b)` while respecting parentheses, brackets, and strings.
+    """
+    if _IMPLIES_KEYWORD not in expr:
+        return expr
+
+    def _is_identifier_char(ch: str) -> bool:
+        return ch.isalnum() or ch in {"_", "."}
+
+    def _skip_string_literal(text: str, start: int) -> int:
+        quote = text[start]
+        triple = text.startswith(quote * 3, start)
+        delimiter = quote * (3 if triple else 1)
+        idx = start + len(delimiter)
+        while idx < len(text):
+            if text.startswith(delimiter, idx):
+                return idx + len(delimiter)
+            if text[idx] == "\\":
+                idx += 2
+            else:
+                idx += 1
+        raise ExpressionEvalError("unterminated string literal in DSL expression")
+
+    def _match_keyword(text: str, index: int) -> bool:
+        if not text.startswith(_IMPLIES_KEYWORD, index):
+            return False
+        before = text[index - 1] if index > 0 else ""
+        after_index = index + len(_IMPLIES_KEYWORD)
+        after = text[after_index] if after_index < len(text) else ""
+        if before and _is_identifier_char(before):
+            return False
+        if after and _is_identifier_char(after):
+            return False
+        return True
+
+    def _find_top_level_keyword(text: str) -> int:
+        stack: List[str] = []
+        idx = 0
+        length = len(text)
+        while idx < length:
+            ch = text[idx]
+            if ch in {"'", '"'}:
+                idx = _skip_string_literal(text, idx)
+                continue
+            if ch in _BRACKET_PAIRS:
+                stack.append(_BRACKET_PAIRS[ch])
+                idx += 1
+                continue
+            if stack and ch == stack[-1]:
+                stack.pop()
+                idx += 1
+                continue
+            if stack:
+                idx += 1
+                continue
+            if _match_keyword(text, idx):
+                return idx
+            idx += 1
+        return -1
+
+    def _rewrite_segment(text: str) -> str:
+        stripped = text.strip()
+        if not stripped:
+            return stripped
+        if _IMPLIES_KEYWORD not in stripped:
+            return stripped
+        keyword_index = _find_top_level_keyword(stripped)
+        if keyword_index != -1:
+            left = stripped[:keyword_index]
+            right = stripped[keyword_index + len(_IMPLIES_KEYWORD):]
+            if not left.strip() or not right.strip():
+                raise ExpressionEvalError("invalid 'implies' operand")
+            left_expr = _rewrite_segment(left)
+            right_expr = _rewrite_segment(right)
+            return f"_nomic_implies({left_expr}, {right_expr})"
+        return _rewrite_nested(stripped)
+
+    def _rewrite_nested(text: str) -> str:
+        if _IMPLIES_KEYWORD not in text:
+            return text
+        result: List[str] = []
+        idx = 0
+        length = len(text)
+        while idx < length:
+            ch = text[idx]
+            if ch in {"'", '"'}:
+                start = idx
+                idx = _skip_string_literal(text, idx)
+                result.append(text[start:idx])
+                continue
+            closing = _BRACKET_PAIRS.get(ch)
+            if closing:
+                start = idx
+                idx += 1
+                depth = 1
+                while idx < length and depth:
+                    current = text[idx]
+                    if current in {"'", '"'}:
+                        idx = _skip_string_literal(text, idx)
+                        continue
+                    if current == ch:
+                        depth += 1
+                    elif current == closing:
+                        depth -= 1
+                    idx += 1
+                if depth != 0:
+                    raise ExpressionEvalError("unbalanced brackets in DSL expression")
+                inner = text[start + 1 : idx - 1]
+                rewritten_inner = _rewrite_segment(inner)
+                result.append(ch + rewritten_inner + closing)
+                continue
+            result.append(ch)
+            idx += 1
+        return "".join(result)
+
+    return _rewrite_segment(expr)
 
 
 class _SafeExpressionInterpreter:
@@ -647,6 +822,7 @@ class _SafeExpressionInterpreter:
         expr = expr.strip()
         if not expr:
             return True
+        expr = _rewrite_implies_expression(expr)
 
         try:
             tree = self._cache.get(expr)
@@ -1690,6 +1866,20 @@ def _collect_includes(clang_tu: "clang_cindex.TranslationUnit") -> List[str]:
     return includes
 
 
+def _enter_control_construct(function: Optional[Function], control_depth: int) -> int:
+    """
+    Track nesting/cognitive complexity when stepping into a control construct.
+    Returns the incremented depth to use for nested children.
+    """
+    if function is None:
+        return control_depth
+    new_depth = control_depth + 1
+    if new_depth > function.nesting_depth:
+        function.nesting_depth = new_depth
+    function.cognitive_complexity += 1 + max(control_depth, 0)
+    return new_depth
+
+
 def _collect_ir_nodes(
     clang_tu: "clang_cindex.TranslationUnit",
     canonical_main: str,
@@ -1700,7 +1890,11 @@ def _collect_ir_nodes(
     macros: List[MacroDefinition] = []
     types: List[TypeDecl] = []
 
-    def visit(cursor: "clang_cindex.Cursor", current_function: Optional[Function]) -> None:
+    def visit(
+        cursor: "clang_cindex.Cursor",
+        current_function: Optional[Function],
+        control_depth: int = 0,
+    ) -> None:
         # Always traverse the TU root even if it has no explicit location.
         if cursor.kind != clang_cindex.CursorKind.TRANSLATION_UNIT:
             if not _cursor_in_main_file(cursor, canonical_main):
@@ -1737,6 +1931,7 @@ def _collect_ir_nodes(
                 current_function.calls.append(callsite)
                 _append_call_to_cfg(current_function, callsite)
         elif cursor.kind == clang_cindex.CursorKind.IF_STMT and current_function is not None:
+            branch_depth = _enter_control_construct(current_function, control_depth)
             if_stmt = _if_stmt_from_cursor(cursor, canonical_main, current_function.name)
             current_function.if_stmts.append(if_stmt)
             condition_block = _record_basic_block(
@@ -1764,7 +1959,7 @@ def _collect_ir_nodes(
             if branch_children:
                 for child in branch_children:
                     with _push_pending_predecessors(current_function, [condition_block.block_id]):
-                        visit(child, next_function)
+                        visit(child, next_function, branch_depth)
                         exit_id = _current_block_id(current_function)
                         if exit_id is not None:
                             branch_exit_blocks.append(exit_id)
@@ -1780,6 +1975,7 @@ def _collect_ir_nodes(
             clang_cindex.CursorKind.WHILE_STMT,
             clang_cindex.CursorKind.DO_STMT,
         ) and current_function is not None:
+            loop_depth = _enter_control_construct(current_function, control_depth)
             loop_stmt = _loop_stmt_from_cursor(cursor, canonical_main, current_function.name)
             current_function.loops.append(loop_stmt)
             loop_block = _record_basic_block(
@@ -1792,12 +1988,13 @@ def _collect_ir_nodes(
             )
             body_child = _find_child_of_kind(cursor, clang_cindex.CursorKind.COMPOUND_STMT, occurrence=0) or cursor
             with _push_pending_predecessors(current_function, [loop_block.block_id]):
-                visit(body_child, next_function)
+                visit(body_child, next_function, loop_depth)
                 exit_id = _current_block_id(current_function)
                 if exit_id is not None:
                     _connect_blocks(current_function, exit_id, loop_block.block_id)
             _set_pending_predecessors(current_function, [loop_block.block_id])
         elif cursor.kind == clang_cindex.CursorKind.SWITCH_STMT and current_function is not None:
+            switch_depth = _enter_control_construct(current_function, control_depth)
             switch_stmt = _switch_stmt_from_cursor(cursor, canonical_main, current_function.name)
             current_function.switches.append(switch_stmt)
             switch_block = _record_basic_block(
@@ -1817,7 +2014,7 @@ def _collect_ir_nodes(
             if case_children:
                 for case_child in case_children:
                     with _push_pending_predecessors(current_function, [switch_block.block_id]):
-                        visit(case_child, next_function)
+                        visit(case_child, next_function, switch_depth)
                         exit_id = _current_block_id(current_function)
                         if exit_id is not None:
                             case_exits.append(exit_id)
@@ -1842,9 +2039,9 @@ def _collect_ir_nodes(
         except Exception:
             children = []
         for child in children:
-            visit(child, next_function)
+            visit(child, next_function, control_depth)
 
-    visit(clang_tu.cursor, None)
+    visit(clang_tu.cursor, None, 0)
     for fn in functions:
         _finalize_function_cfg(fn)
     return functions, globals_list, macros, types
@@ -1929,6 +2126,7 @@ def _function_from_cursor(
     source_range = _make_source_range(cursor.extent, canonical_main)
     storage = _storage_class_to_variable_storage(cursor.storage_class)
     linkage = "internal" if storage == "static" else _linkage_to_string(cursor.linkage)
+    storage_class = storage if storage != "unknown" else None
 
     parameters: List[Variable] = []
     try:
@@ -1938,17 +2136,25 @@ def _function_from_cursor(
     for index, arg in enumerate(args):
         parameters.append(_param_variable_from_cursor(arg, canonical_main, cursor.spelling or f"fn_{id(cursor)}", index))
 
+    attributes = _cursor_attributes(cursor)
+    inline_hint = bool(getattr(cursor, "is_inline_function", lambda: False)())
+    interrupt_attr = any(
+        token in attr.lower()
+        for attr in attributes
+        for token in ("interrupt", "isr", "irq")
+    )
+
     function = Function(
         name=cursor.spelling or cursor.displayname or "<anonymous>",
         return_type=cursor.result_type.spelling if cursor.result_type else "void",
         parameters=parameters,
         local_vars=[],
         linkage=linkage,
-        storage=storage if storage != "unknown" else None,
-        attributes=_cursor_attributes(cursor),
+        storage_class=storage_class,
+        attributes=attributes,
         annotations=[],
-        is_isr=False,
-        is_inline=bool(getattr(cursor, "is_inline_function", lambda: False)()),
+        inline_hint=inline_hint,
+        isr_hint=interrupt_attr,
         calls=[],
         cfg=ControlFlowGraph(),
         exit_points=[],
@@ -2348,6 +2554,7 @@ def _current_block(function: Function) -> Optional[BasicBlock]:
 def _finalize_function_cfg(function: Function) -> None:
     cfg = function.cfg
     if not cfg.blocks:
+        function.cyclomatic_complexity = 1
         return
     if cfg.entry_block is None:
         cfg.entry_block = min(cfg.blocks.keys())
@@ -2412,6 +2619,19 @@ def _finalize_function_cfg(function: Function) -> None:
 
     for bid, pdoms in postdominators.items():
         cfg.blocks[bid].postdominators = set(pdoms)
+
+    function.cyclomatic_complexity = _calculate_cyclomatic_complexity(function)
+
+
+def _calculate_cyclomatic_complexity(function: Function) -> int:
+    cfg = function.cfg
+    if not cfg.blocks:
+        return 1
+    edges = sum(len(block.successors) for block in cfg.blocks.values())
+    nodes = len(cfg.blocks)
+    components = 1 if nodes > 0 else 0
+    complexity = edges - nodes + 2 * components
+    return complexity if complexity > 0 else 1
 
 
 def _record_statement_in_block(
