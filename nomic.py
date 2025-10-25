@@ -15,7 +15,7 @@ Nomic C Code Analysis Copyright (C) 2025-2026 Manny Peterson
 
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, Tuple, Union, Literal, Any, Set
+from typing import List, Dict, Optional, Tuple, Union, Literal, Any, Set, Iterable, Callable
 import argparse
 import ast
 from collections import deque
@@ -60,6 +60,10 @@ class SourceLocation:
     line: int
     column: int
 
+    @property
+    def filename(self) -> str:
+        return os.path.basename(self.file)
+
 
 @dataclass
 class SourceRange:
@@ -68,6 +72,14 @@ class SourceRange:
     col_start: int
     line_end: int
     col_end: int
+
+    @property
+    def start_line(self) -> int:
+        return self.line_start
+
+    @property
+    def end_line(self) -> int:
+        return self.line_end
 
 
 @dataclass
@@ -178,6 +190,104 @@ class Variable:
 
     writes: List[WriteSite] = field(default_factory=list)
     reads: List[ReadSite] = field(default_factory=list)
+    written_by: Set[str] = field(default_factory=set)
+    read_by: Set[str] = field(default_factory=set)
+    is_initialized: bool = False
+    original_type: Optional[str] = None
+    has_mutex_protection: bool = False
+
+    @property
+    def type_name(self) -> str:
+        return self.ctype
+
+    @property
+    def base_type(self) -> str:
+        text = self.ctype or ""
+        text = text.replace("const", "").replace("volatile", "")
+        return text.replace("*", "").strip()
+
+    @property
+    def is_global(self) -> bool:
+        return self.scope == "file" and self.storage != "static"
+
+    @property
+    def is_static(self) -> bool:
+        return self.storage == "static"
+
+    @property
+    def is_extern(self) -> bool:
+        return self.storage == "extern"
+
+    @property
+    def is_parameter(self) -> bool:
+        return self.scope == "param"
+
+    @property
+    def is_local(self) -> bool:
+        return self.scope in ("function", "block")
+
+    @property
+    def parent_function(self) -> Optional[str]:
+        return self.decl_function
+
+    @property
+    def is_modified(self) -> bool:
+        return bool(self.writes)
+
+    @property
+    def source_location(self) -> Optional[SourceLocation]:
+        if self.source_range:
+            return SourceLocation(
+                file=self.source_range.file,
+                line=self.source_range.line_start,
+                column=self.source_range.col_start,
+            )
+        return None
+
+    @property
+    def type_equivalent(self) -> str:
+        return get_type_equivalent(self.ctype)
+
+    @property
+    def is_custom_type(self) -> bool:
+        return is_custom_type(self.type_name)
+
+
+TYPE_MAP: Dict[str, str] = {
+    "u8": "uint8_t",
+    "u16": "uint16_t",
+    "u32": "uint32_t",
+    "u64": "uint64_t",
+}
+
+CUSTOM_TYPE_SUFFIXES: Tuple[str, ...] = ("_t",)
+CUSTOM_TYPE_REGISTRY: Set[str] = set()
+
+
+def register_custom_types(types: Iterable[str]) -> None:
+    CUSTOM_TYPE_REGISTRY.update(t for t in types if t)
+
+
+def is_custom_type(type_name: Optional[str]) -> bool:
+    if not type_name:
+        return False
+    lowered = type_name.strip()
+    if lowered in CUSTOM_TYPE_REGISTRY:
+        return True
+    if lowered in TYPE_MAP.values() or lowered in TYPE_MAP.keys():
+        return True
+    return any(lowered.endswith(suffix) for suffix in CUSTOM_TYPE_SUFFIXES)
+
+
+def get_type_equivalent(c_type: Optional[str]) -> str:
+    if not c_type:
+        return ""
+    key = c_type.strip()
+    return TYPE_MAP.get(key, key)
+
+
+def check_type_compliance(var: Variable) -> bool:
+    return is_custom_type(var.type_name)
 
 
 # ============================================================
@@ -211,12 +321,57 @@ class CallSite:
 # ================= CONTROL FLOW GRAPH =======================
 # ============================================================
 
+_IDENTIFIER_RE = re.compile(r"\b[_A-Za-z][_A-Za-z0-9]*\b")
+
+
+def _extract_identifiers(text: str) -> List[str]:
+    return _IDENTIFIER_RE.findall(text or "")
+
+
+@dataclass
+class Statement:
+    """Rich statement wrapper used inside CFG blocks and structured statements."""
+    text: str
+    contains_call: bool = False
+    contains_return: bool = False
+    contains_assignment: bool = False
+    contains_macro: bool = False
+    macro_names: List[str] = field(default_factory=list)
+    variables_read: List[str] = field(default_factory=list)
+    variables_written: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        normalized = (self.text or "").strip()
+        lowered = normalized.lower()
+        assignment_tokens = ["=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", ">>=", "<<="]
+        self.contains_assignment = any(token in normalized for token in assignment_tokens)
+        self.contains_return = "return" in lowered
+        self.contains_call = "(" in normalized and ")" in normalized and not normalized.startswith("{")
+        macro_candidates = [
+            token for token in _extract_identifiers(normalized) if token.isupper()
+        ]
+        self.macro_names = macro_candidates
+        self.contains_macro = bool(macro_candidates)
+
+        if self.contains_assignment and "=" in normalized:
+            lhs, _, rhs = normalized.partition("=")
+            self.variables_written = _extract_identifiers(lhs)
+            self.variables_read = _extract_identifiers(rhs)
+        else:
+            self.variables_read = _extract_identifiers(normalized)
+            self.variables_written = []
+
+
+def _statement_from_text(text: str) -> "Statement":
+    return Statement(text=text or "")
+
+
 @dataclass
 class BasicBlock:
     """CFG node describing linearized statements plus intra-block calls/reads/writes."""
     block_id: int
 
-    statements: List[str] = field(default_factory=list)    # human-readable summaries/snippets
+    statements: List[Statement] = field(default_factory=list)
     calls: List[CallSite] = field(default_factory=list)
     writes: List[WriteSite] = field(default_factory=list)
     reads: List[ReadSite] = field(default_factory=list)
@@ -230,17 +385,74 @@ class BasicBlock:
     postdominators: Set[int] = field(default_factory=set)
 
     is_exit_block: bool = False
+    loop_depth: int = 0
+    parent_loop: Optional["LoopStmt"] = None
+    is_loop_header: bool = False
+    is_loop_exit: bool = False
 
     source_range: Optional[SourceRange] = None
     preprocessor: PreprocessorContext = field(default_factory=PreprocessorContext)
+    function: Optional["Function"] = field(default=None, repr=False)
+
+    @property
+    def first_statement(self) -> Optional[Statement]:
+        return self.statements[0] if self.statements else None
+
+    @property
+    def last_statement(self) -> Optional[Statement]:
+        return self.statements[-1] if self.statements else None
+
+    @property
+    def call_sites(self) -> List[CallSite]:
+        return list(self.calls)
 
 
 @dataclass
 class ControlFlowGraph:
     """Owns the per-function CFG including blocks, entry, exits, and analyses."""
     blocks: Dict[int, BasicBlock] = field(default_factory=dict)
-    entry_block: Optional[int] = None
-    exit_blocks: List[int] = field(default_factory=list)
+    _entry_block_id: Optional[int] = None
+    _exit_block_ids: List[int] = field(default_factory=list)
+
+    @property
+    def entry_block_id(self) -> Optional[int]:
+        return self._entry_block_id
+
+    @property
+    def entry_block(self) -> Optional[BasicBlock]:
+        if self._entry_block_id is None:
+            return None
+        return self.blocks.get(self._entry_block_id)
+
+    @entry_block.setter
+    def entry_block(self, value: Optional[Union[int, BasicBlock]]) -> None:
+        if isinstance(value, BasicBlock):
+            self._entry_block_id = value.block_id
+        else:
+            self._entry_block_id = value
+
+    @property
+    def exit_block_ids(self) -> List[int]:
+        return list(self._exit_block_ids)
+
+    @property
+    def exit_blocks(self) -> List[BasicBlock]:
+        return [self.blocks[bid] for bid in self._exit_block_ids if bid in self.blocks]
+
+    @exit_blocks.setter
+    def exit_blocks(self, values: List[Union[int, BasicBlock]]) -> None:
+        ids: List[int] = []
+        for value in values:
+            if isinstance(value, BasicBlock):
+                ids.append(value.block_id)
+            else:
+                ids.append(value)
+        self._exit_block_ids = ids
+
+    @property
+    def exit_block(self) -> Optional[BasicBlock]:
+        blocks = self.exit_blocks
+        return blocks[0] if blocks else None
 
     def all_exit_paths_postdominated_by(self, matcher: Any) -> bool:
         """
@@ -254,7 +466,7 @@ class ControlFlowGraph:
         """
         if not self.blocks or self.entry_block is None:
             return False
-        entry_block = self.blocks.get(self.entry_block)
+        entry_block = self.entry_block
         if entry_block is None:
             return False
         entry_postdoms = entry_block.postdominators
@@ -264,6 +476,137 @@ class ControlFlowGraph:
             if block_id in entry_postdoms and matcher(block):
                 return True
         return False
+
+    def has_path_without(self, matcher: Any) -> bool:
+        """
+        Return True if there exists a path from entry to any exit that never satisfies matcher.
+        """
+        entry = self.entry_block
+        if entry is None:
+            return False
+        stack: List[Tuple[int, bool]] = [(entry.block_id, bool(matcher(entry)))]
+        visited: Dict[int, bool] = {}
+        while stack:
+            block_id, seen_match = stack.pop()
+            block = self.blocks.get(block_id)
+            if block is None:
+                continue
+            if block.is_exit_block and not seen_match:
+                return True
+            for succ in block.successors:
+                next_block = self.blocks.get(succ)
+                if next_block is None:
+                    continue
+                next_seen = seen_match or bool(matcher(next_block))
+                if visited.get(succ) is True and next_seen:
+                    continue
+                visited[succ] = next_seen
+                stack.append((succ, next_seen))
+        return False
+
+    def get_paths_to_exit(self, max_paths: int = 1024) -> List[List[BasicBlock]]:
+        """
+        Enumerate paths from entry to exits up to `max_paths` results.
+        """
+        entry = self.entry_block
+        if entry is None:
+            return []
+        paths: List[List[BasicBlock]] = []
+        stack: List[Tuple[int, List[int]]] = [(entry.block_id, [entry.block_id])]
+        while stack:
+            block_id, path = stack.pop()
+            block = self.blocks.get(block_id)
+            if block is None:
+                continue
+            if block.is_exit_block or not block.successors:
+                paths.append([self.blocks[b] for b in path if b in self.blocks])
+                if len(paths) >= max_paths:
+                    break
+                continue
+            for succ in block.successors:
+                if succ in path:
+                    continue  # avoid infinite loops
+                stack.append((succ, path + [succ]))
+        return paths
+
+
+def _cfg_for_block(block: BasicBlock) -> Optional[ControlFlowGraph]:
+    if block.function is None:
+        return None
+    return block.function.cfg
+
+
+def all_paths_reach(start_block: BasicBlock, condition: Callable[[BasicBlock], bool]) -> bool:
+    cfg = _cfg_for_block(start_block)
+    if cfg is None:
+        return False
+    stack: List[Tuple[int, bool]] = [(start_block.block_id, bool(condition(start_block)))]
+    visited: Set[Tuple[int, bool]] = set()
+    while stack:
+        block_id, seen = stack.pop()
+        block = cfg.blocks.get(block_id)
+        if block is None:
+            continue
+        if block.is_exit_block and not seen:
+            return False
+        for succ in block.successors:
+            succ_block = cfg.blocks.get(succ)
+            if succ_block is None:
+                continue
+            next_seen = seen or bool(condition(succ_block))
+            key = (succ, next_seen)
+            if key in visited:
+                continue
+            visited.add(key)
+            stack.append((succ, next_seen))
+    return True
+
+
+def any_path_reaches(start_block: BasicBlock, condition: Callable[[BasicBlock], bool]) -> bool:
+    cfg = _cfg_for_block(start_block)
+    if cfg is None:
+        return False
+    stack: List[int] = [start_block.block_id]
+    visited: Set[int] = set()
+    while stack:
+        block_id = stack.pop()
+        block = cfg.blocks.get(block_id)
+        if block is None or block_id in visited:
+            continue
+        visited.add(block_id)
+        if condition(block):
+            return True
+        for succ in block.successors:
+            stack.append(succ)
+    return False
+
+
+def paths_between(
+    start_block: BasicBlock,
+    target_block: BasicBlock,
+    *,
+    max_paths: int = 256,
+) -> List[List[BasicBlock]]:
+    if start_block.function is None or target_block.function is None:
+        return []
+    if start_block.function is not target_block.function:
+        return []
+    cfg = start_block.function.cfg
+    paths: List[List[BasicBlock]] = []
+    stack: List[Tuple[int, List[int]]] = [(start_block.block_id, [start_block.block_id])]
+    while stack and len(paths) < max_paths:
+        block_id, path = stack.pop()
+        if block_id == target_block.block_id:
+            paths.append([cfg.blocks[b] for b in path if b in cfg.blocks])
+            continue
+        block = cfg.blocks.get(block_id)
+        if block is None:
+            continue
+        for succ in block.successors:
+            if succ in path:
+                continue
+            stack.append((succ, path + [succ]))
+    return paths
 
 
 # ============================================================
@@ -279,7 +622,7 @@ class BlockStmt:
     - body of a loop
     - body of a switch case
     """
-    statements: List[str] = field(default_factory=list)
+    statements: List[Statement] = field(default_factory=list)
     writes: List[WriteSite] = field(default_factory=list)
     reads: List[ReadSite] = field(default_factory=list)
     calls: List[CallSite] = field(default_factory=list)
@@ -364,6 +707,9 @@ class Function:
     globals_written: List[str] = field(default_factory=list)
     globals_read: List[str] = field(default_factory=list)
 
+    called_by: List[str] = field(default_factory=list)
+    dominates: List[str] = field(default_factory=list)
+
     source_range: Optional[SourceRange] = None
     preprocessor: PreprocessorContext = field(default_factory=PreprocessorContext)
 
@@ -414,6 +760,90 @@ class Function:
     @is_isr.setter
     def is_isr(self, value: bool) -> None:
         self.isr_hint = value
+
+    @property
+    def is_api(self) -> bool:
+        return is_api_function(self)
+
+    @property
+    def is_callback(self) -> bool:
+        return is_callback_function(self)
+
+    @property
+    def is_syscall(self) -> bool:
+        return is_syscall_function(self)
+
+    @property
+    def has_critical_section(self) -> bool:
+        return any(call.is_lock or call.is_unlock for call in self.calls)
+
+    @property
+    def has_mutex_protection(self) -> bool:
+        has_lock = any(call.is_lock for call in self.calls)
+        has_unlock = any(call.is_unlock for call in self.calls)
+        if has_lock and has_unlock:
+            return True
+        return any(var.has_mutex_protection for var in self.local_vars + self.parameters)
+
+    @property
+    def all_statements(self) -> List[Statement]:
+        stmts: List[Statement] = []
+        for block_id in sorted(self.cfg.blocks.keys()):
+            stmts.extend(self.cfg.blocks[block_id].statements)
+        return stmts
+
+    @property
+    def entry_statements(self) -> List[Statement]:
+        entry = self.cfg.entry_block
+        return list(entry.statements) if entry else []
+
+    @property
+    def exit_statements(self) -> List[Statement]:
+        statements: List[Statement] = []
+        for block in self.cfg.exit_blocks:
+            statements.extend(block.statements)
+        return statements
+
+    def update_called_by(self, callers: Iterable[str]) -> None:
+        self.called_by = sorted(set(callers))
+
+    def update_dominates(self, dominated: Iterable[str]) -> None:
+        self.dominates = sorted(set(dominated))
+
+
+API_NAMING_PREFIXES: Tuple[str, ...] = ("api_", "svc_", "public_", "exposed_")
+CALLBACK_SUFFIXES: Tuple[str, ...] = ("_cb", "_callback", "_handler")
+SYSCALL_PREFIXES: Tuple[str, ...] = ("sys_", "syscall_", "k_", "os_")
+
+
+def is_api_function(fn: Function, prefixes: Optional[Iterable[str]] = None) -> bool:
+    if fn.is_static:
+        return False
+    prefix_tuple = tuple(p.lower() for p in (prefixes or API_NAMING_PREFIXES))
+    name = (fn.name or "").lower()
+    if any(name.startswith(pref) for pref in prefix_tuple):
+        return True
+    return any("api" in (ann.text or "").lower() for ann in fn.annotations)
+
+
+def is_callback_function(fn: Function, suffixes: Optional[Iterable[str]] = None) -> bool:
+    suffix_tuple = tuple(s.lower() for s in (suffixes or CALLBACK_SUFFIXES))
+    name = (fn.name or "").lower()
+    if any(name.endswith(suf) for suf in suffix_tuple):
+        return True
+    return any("callback" in (ann.text or "").lower() for ann in fn.annotations)
+
+
+def is_syscall_function(fn: Function, prefixes: Optional[Iterable[str]] = None) -> bool:
+    prefix_tuple = tuple(p.lower() for p in (prefixes or SYSCALL_PREFIXES))
+    name = (fn.name or "").lower()
+    if any(name.startswith(pref) for pref in prefix_tuple):
+        return True
+    return any("syscall" in attr.lower() for attr in fn.attributes)
+
+
+def detect_isr(fn: Function) -> bool:
+    return fn.is_isr
 
 
 # ============================================================
@@ -653,6 +1083,8 @@ _SAFE_BASE_CALLABLES: Dict[str, Any] = {
     "count": _wrap_safe_callable(_count_helper),
     "_nomic_implies": _wrap_safe_callable(_implies_helper),
     "implies": _wrap_safe_callable(_implies_helper),
+    "hasattr": _wrap_safe_callable(hasattr),
+    "safe_getattr": _wrap_safe_callable(lambda obj, name, default=None: getattr(obj, name, default)),
 }
 
 TEMPLATE_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
@@ -881,6 +1313,9 @@ class _SafeExpressionInterpreter:
             branch = node.body if condition else node.orelse
             return self._eval_node(branch, env)
 
+        if isinstance(node, ast.Lambda):
+            return self._build_lambda(node, env)
+
         if isinstance(node, ast.Attribute):
             value = self._eval_node(node.value, env)
             if node.attr.startswith("_"):
@@ -972,6 +1407,22 @@ class _SafeExpressionInterpreter:
         if isinstance(operator_node, ast.IsNot):
             return left is not right
         raise ExpressionEvalError("unsupported comparison operator")
+
+    def _build_lambda(self, node: ast.Lambda, env: Dict[str, Any]) -> Any:
+        arg_names = [arg.arg for arg in node.args.args]
+        default_values = [self._eval_node(default, env) for default in node.args.defaults]
+
+        def _lambda_impl(*lambda_args: Any) -> Any:
+            local_env = dict(env)
+            bound_args = list(lambda_args)
+            if len(bound_args) < len(arg_names) and default_values:
+                missing = len(arg_names) - len(bound_args)
+                bound_args.extend(default_values[-missing:])
+            for name, value in zip(arg_names, bound_args):
+                local_env[name] = value
+            return self._eval_node(node.body, local_env)
+
+        return _wrap_dynamic_callable(lambda *args, **kwargs: _lambda_impl(*args, **kwargs))
 
     def _build_generator(self, node: ast.GeneratorExp, env: Dict[str, Any]) -> Any:
         def generator() -> Any:
@@ -1187,6 +1638,15 @@ class RuleEngine:
                 "calls_function": self._make_env_callable(self._calls_function_helper),
                 "call_path_exists": self._make_env_callable(self._call_path_helper),
                 "reachable_functions": self._make_env_callable(self._reachable_functions_helper),
+                "all_paths_reach": self._make_env_callable(all_paths_reach),
+                "any_path_reaches": self._make_env_callable(any_path_reaches),
+                "paths_between": self._make_env_callable(paths_between),
+                "has_blocking_call_path": self._make_env_callable(self._blocking_call_path_helper),
+                "detect_isr": self._make_env_callable(detect_isr),
+                "check_type_compliance": self._make_env_callable(check_type_compliance),
+                "is_api_function": self._make_env_callable(is_api_function),
+                "is_callback_function": self._make_env_callable(is_callback_function),
+                "is_syscall_function": self._make_env_callable(is_syscall_function),
             }
         )
         return env
@@ -1328,6 +1788,25 @@ class RuleEngine:
                     reachable.add(neighbor)
                     queue.append((neighbor, depth + 1))
         return sorted(reachable)
+
+    def _blocking_call_path_helper(self, caller: Any, max_depth: int = 32) -> bool:
+        start = self._extract_symbol_name(caller)
+        if not start:
+            return False
+        visited = set([start])
+        queue: deque[Tuple[str, int]] = deque([(start, 0)])
+        while queue:
+            symbol, depth = queue.popleft()
+            if depth > max_depth:
+                continue
+            for fn in self.project_db.functions_by_name.get(symbol, []):
+                if any(call.is_blocking_api for call in fn.calls):
+                    return True
+            for neighbor in self.project_db.call_graph.get(symbol, set()):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, depth + 1))
+        return False
 
     def _extract_symbol_name(self, obj: Any) -> Optional[str]:
         if obj is None:
@@ -1755,6 +2234,16 @@ def stitch_project_db(tus: List[TranslationUnit]) -> ProjectDB:
         for g in tu.globals:
             db.globals_by_name.setdefault(g.name, []).append(g)
 
+    for tu in tus:
+        variable_iterables = [tu.globals]
+        for fn in tu.functions:
+            variable_iterables.append(fn.parameters)
+            variable_iterables.append(fn.local_vars)
+        for collection in variable_iterables:
+            for var in collection:
+                if var.writes and not var.is_initialized:
+                    var.is_initialized = True
+
     # Index macros
     for tu in tus:
         for m in tu.macros:
@@ -1769,7 +2258,61 @@ def stitch_project_db(tus: List[TranslationUnit]) -> ProjectDB:
     # Example: known blocking APIs, etc.
     # db.function_metadata["sleep_ms"] = {"is_blocking_api": True}
 
+    reverse_graph: Dict[str, Set[str]] = {}
+    all_nodes: Set[str] = set(db.call_graph.keys())
+    for callees in db.call_graph.values():
+        all_nodes.update(callees)
+    for node in all_nodes:
+        reverse_graph.setdefault(node, set())
+    for caller, callees in db.call_graph.items():
+        for callee in callees:
+            reverse_graph.setdefault(callee, set()).add(caller)
+    dominators = _compute_call_graph_dominators(db.call_graph)
+    for name, functions in db.functions_by_name.items():
+        callers = reverse_graph.get(name, set())
+        dominated = {node for node, domset in dominators.items() if name in domset and node != name}
+        for fn in functions:
+            fn.update_called_by(callers)
+            fn.update_dominates(dominated)
+
     return db
+
+
+def _compute_call_graph_dominators(graph: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
+    nodes: Set[str] = set(graph.keys())
+    for targets in graph.values():
+        nodes.update(targets)
+    if not nodes:
+        return {}
+    predecessors: Dict[str, Set[str]] = {node: set() for node in nodes}
+    for caller, callees in graph.items():
+        for callee in callees:
+            predecessors.setdefault(callee, set()).add(caller)
+        predecessors.setdefault(caller, predecessors.get(caller, set()))
+    entry_nodes = {node for node in nodes if not predecessors.get(node)}
+    if not entry_nodes:
+        entry_nodes = set(nodes)
+    dominators: Dict[str, Set[str]] = {node: set(nodes) for node in nodes}
+    for entry in entry_nodes:
+        dominators[entry] = {entry}
+    changed = True
+    while changed:
+        changed = False
+        for node in nodes:
+            if node in entry_nodes:
+                continue
+            preds = predecessors.get(node, set())
+            if preds:
+                intersect = set(nodes)
+                for pred in preds:
+                    intersect &= dominators.get(pred, set(nodes))
+            else:
+                intersect = set(nodes)
+            intersect.add(node)
+            if intersect != dominators[node]:
+                dominators[node] = intersect
+                changed = True
+    return dominators
 
 
 def _warn_once_clang_missing() -> None:
@@ -1978,21 +2521,28 @@ def _collect_ir_nodes(
             loop_depth = _enter_control_construct(current_function, control_depth)
             loop_stmt = _loop_stmt_from_cursor(cursor, canonical_main, current_function.name)
             current_function.loops.append(loop_stmt)
-            loop_block = _record_basic_block(
-                current_function,
-                f"Loop: {loop_stmt.kind}",
-                cursor,
-                canonical_main,
-                enclosing_construct="loop_stmt",
-                branch_condition=loop_stmt.condition,
-            )
-            body_child = _find_child_of_kind(cursor, clang_cindex.CursorKind.COMPOUND_STMT, occurrence=0) or cursor
-            with _push_pending_predecessors(current_function, [loop_block.block_id]):
-                visit(body_child, next_function, loop_depth)
-                exit_id = _current_block_id(current_function)
-                if exit_id is not None:
-                    _connect_blocks(current_function, exit_id, loop_block.block_id)
-            _set_pending_predecessors(current_function, [loop_block.block_id])
+            with _push_loop_context(current_function, loop_stmt):
+                loop_block = _record_basic_block(
+                    current_function,
+                    f"Loop: {loop_stmt.kind}",
+                    cursor,
+                    canonical_main,
+                    enclosing_construct="loop_stmt",
+                    branch_condition=loop_stmt.condition,
+                )
+                loop_block.is_loop_header = True
+                loop_block.parent_loop = loop_stmt
+                body_child = _find_child_of_kind(cursor, clang_cindex.CursorKind.COMPOUND_STMT, occurrence=0) or cursor
+                with _push_pending_predecessors(current_function, [loop_block.block_id]):
+                    visit(body_child, next_function, loop_depth)
+                    exit_id = _current_block_id(current_function)
+                    if exit_id is not None:
+                        exit_block = current_function.cfg.blocks.get(exit_id)
+                        if exit_block is not None:
+                            exit_block.is_loop_exit = True
+                            exit_block.parent_loop = loop_stmt
+                        _connect_blocks(current_function, exit_id, loop_block.block_id)
+                _set_pending_predecessors(current_function, [loop_block.block_id])
         elif cursor.kind == clang_cindex.CursorKind.SWITCH_STMT and current_function is not None:
             switch_depth = _enter_control_construct(current_function, control_depth)
             switch_stmt = _switch_stmt_from_cursor(cursor, canonical_main, current_function.name)
@@ -2423,23 +2973,28 @@ def _initialize_function_cfg(function: Function) -> None:
         return
     entry_block = BasicBlock(
         block_id=0,
-        statements=["entry"],
+        statements=[_statement_from_text("entry")],
         successors=[],
         predecessors=[],
         source_range=function.source_range,
         preprocessor=function.preprocessor,
+        function=function,
     )
     function.cfg.blocks[0] = entry_block
-    function.cfg.entry_block = 0
-    function.cfg.exit_blocks = [0]
+    function.cfg.entry_block = entry_block
+    function.cfg.exit_blocks = [entry_block]
     function.exit_points = [0]
-    setattr(function, "_cfg_state", {"next_block_id": 1, "current_block_id": 0})
+    setattr(function, "_cfg_state", {"next_block_id": 1, "current_block_id": 0, "loop_stack": []})
 
 
 def _get_cfg_state(function: Function) -> Dict[str, Any]:
     state = getattr(function, "_cfg_state", None)
     if state is None:
-        state = {"next_block_id": len(function.cfg.blocks) or 1, "current_block_id": function.cfg.entry_block or 0}
+        state = {
+            "next_block_id": len(function.cfg.blocks) or 1,
+            "current_block_id": function.cfg.entry_block_id or 0,
+            "loop_stack": [],
+        }
         setattr(function, "_cfg_state", state)
     return state
 
@@ -2468,6 +3023,17 @@ def _push_pending_predecessors(function: Function, preds: List[int]):
         yield
     finally:
         state["pending_predecessors"] = previous
+
+
+@contextmanager
+def _push_loop_context(function: Function, loop_stmt: LoopStmt):
+    state = _get_cfg_state(function)
+    stack: List[LoopStmt] = state.setdefault("loop_stack", [])  # type: ignore[assignment]
+    stack.append(loop_stmt)
+    try:
+        yield
+    finally:
+        stack.pop()
 
 
 def _connect_blocks(function: Function, from_block_id: Optional[int], to_block_id: Optional[int]) -> None:
@@ -2501,13 +3067,18 @@ def _record_basic_block(
     block_id = state["next_block_id"]
     state["next_block_id"] += 1
 
+    loop_stack: List[Any] = state.get("loop_stack", [])
+
     block = BasicBlock(
         block_id=block_id,
-        statements=[description],
+        statements=[_statement_from_text(description)],
         enclosing_construct=enclosing_construct,
         branch_condition=branch_condition,
         source_range=_make_source_range(cursor.extent, canonical_main),
         preprocessor=PreprocessorContext(),
+        loop_depth=len(loop_stack),
+        parent_loop=loop_stack[-1] if loop_stack else None,
+        function=function,
     )
 
     pending = state.get("pending_predecessors", [])
@@ -2556,18 +3127,18 @@ def _finalize_function_cfg(function: Function) -> None:
     if not cfg.blocks:
         function.cyclomatic_complexity = 1
         return
-    if cfg.entry_block is None:
+    if cfg.entry_block_id is None:
         cfg.entry_block = min(cfg.blocks.keys())
-    exit_blocks = [bid for bid, block in cfg.blocks.items() if not block.successors]
-    if not exit_blocks:
-        exit_blocks = [max(cfg.blocks.keys())]
-    cfg.exit_blocks = exit_blocks
+    exit_ids = [bid for bid, block in cfg.blocks.items() if not block.successors]
+    if not exit_ids:
+        exit_ids = [max(cfg.blocks.keys())]
+    cfg.exit_blocks = exit_ids
     for bid, block in cfg.blocks.items():
-        block.is_exit_block = bid in exit_blocks
-    function.exit_points = exit_blocks
+        block.is_exit_block = bid in exit_ids
+    function.exit_points = exit_ids
 
     block_ids = list(cfg.blocks.keys())
-    entry = cfg.entry_block
+    entry = cfg.entry_block_id
     dominators: Dict[int, Set[int]] = {bid: set(block_ids) for bid in block_ids}
     if entry is not None:
         dominators[entry] = {entry}
@@ -2595,14 +3166,14 @@ def _finalize_function_cfg(function: Function) -> None:
         cfg.blocks[bid].dominators = set(doms)
 
     postdominators: Dict[int, Set[int]] = {bid: set(block_ids) for bid in block_ids}
-    for exit_id in exit_blocks:
+    for exit_id in exit_ids:
         postdominators[exit_id] = {exit_id}
 
     changed = True
     while changed:
         changed = False
         for bid in block_ids:
-            if bid in exit_blocks:
+            if bid in exit_ids:
                 continue
             block = cfg.blocks[bid]
             succs = block.successors
@@ -2661,7 +3232,7 @@ def _record_statement_in_block(
             return
     snippet = _cursor_snippet(cursor)
     if snippet:
-        block.statements.append(snippet)
+        block.statements.append(_statement_from_text(snippet))
 
 
 def _record_write_site(
@@ -2791,14 +3362,14 @@ def _block_stmt_from_cursor(
 ) -> BlockStmt:
     if cursor is None:
         return BlockStmt(statements=[], source_range=None, preprocessor=PreprocessorContext())
-    statements: List[str] = []
+    statements: List[Statement] = []
     writes: List[WriteSite] = []
     calls: List[CallSite] = []
     reads: List[ReadSite] = []
     for child in cursor.get_children():
         snippet = _cursor_snippet(child)
         if snippet:
-            statements.append(snippet)
+            statements.append(_statement_from_text(snippet))
         if child.kind == clang_cindex.CursorKind.CALL_EXPR:
             call = _callsite_from_cursor(child, canonical_main)
             if call:
