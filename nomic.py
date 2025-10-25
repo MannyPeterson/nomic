@@ -359,7 +359,7 @@ class Statement:
             self.variables_read = _extract_identifiers(rhs)
         else:
             self.variables_read = _extract_identifiers(normalized)
-        self.variables_written = []
+            self.variables_written = []
 
 
 def _statement_from_text(text: str) -> "Statement":
