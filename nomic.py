@@ -37,6 +37,19 @@ except ImportError:  # pragma: no cover - environment without libclang
     clang_cindex = None  # type: ignore
 
 
+if clang_cindex is not None:
+    _STATEMENT_CURSOR_KINDS = {
+        clang_cindex.CursorKind.RETURN_STMT,
+        clang_cindex.CursorKind.BINARY_OPERATOR,
+        clang_cindex.CursorKind.COMPOUND_ASSIGNMENT_OPERATOR,
+        clang_cindex.CursorKind.DECL_STMT,
+        clang_cindex.CursorKind.UNEXPOSED_EXPR,
+        clang_cindex.CursorKind.CALL_EXPR,
+    }
+else:  # pragma: no cover - stub mode
+    _STATEMENT_CURSOR_KINDS: Set[Any] = set()
+
+
 # ============================================================
 # =============== SOURCE LOCATION & CONTEXT ==================
 # ============================================================
@@ -83,6 +96,7 @@ class Annotation:
 
 @dataclass
 class FieldDecl:
+    """Represents a struct/union/enum field including bitfield metadata."""
     name: str
     ctype: str  # resolved type string
     is_bitfield: bool = False
@@ -93,7 +107,8 @@ class FieldDecl:
 @dataclass
 class TypeDecl:
     """
-    typedefs, struct/union/enum.
+    Captures typedef / struct / union / enum declarations emitted by clang,
+    including attributes, fields, and source metadata.
     """
     name: str
     kind: Literal["typedef", "struct", "union", "enum"]
@@ -112,6 +127,7 @@ class TypeDecl:
 
 @dataclass
 class WriteSite:
+    """Records a write to a variable, capturing structural context (branch/loop/macro)."""
     location: SourceRange
     in_branch: Optional[str] = None     # "then", "else", "case", etc.
     in_loop: Optional[str] = None       # "for", "while", "do_while"
@@ -122,6 +138,7 @@ class WriteSite:
 
 @dataclass
 class ReadSite:
+    """Records a read from a variable with the same structural metadata as WriteSite."""
     location: SourceRange
     in_branch: Optional[str] = None
     in_loop: Optional[str] = None
@@ -137,7 +154,8 @@ class ReadSite:
 @dataclass
 class Variable:
     """
-    Represents globals, statics, locals, params, etc.
+    Represents globals, statics, locals, params, etc., including type
+    qualifiers, storage, annotations, and tracked read/write sites.
     """
     name: str
     ctype: str  # fully resolved C type
@@ -168,6 +186,7 @@ class Variable:
 
 @dataclass
 class CallSite:
+    """Describes an individual function call expression discovered by clang."""
     callee_name: str                           # text in code
     callee_symbol: Optional[str] = None        # resolved canonical name, if known
 
@@ -194,11 +213,13 @@ class CallSite:
 
 @dataclass
 class BasicBlock:
+    """CFG node describing linearized statements plus intra-block calls/reads/writes."""
     block_id: int
 
     statements: List[str] = field(default_factory=list)    # human-readable summaries/snippets
     calls: List[CallSite] = field(default_factory=list)
     writes: List[WriteSite] = field(default_factory=list)
+    reads: List[ReadSite] = field(default_factory=list)
 
     enclosing_construct: Optional[str] = None  # "if_then", "if_else", "loop", "switch_case", etc.
     branch_condition: Optional[str] = None     # textual condition for this arm
@@ -216,6 +237,7 @@ class BasicBlock:
 
 @dataclass
 class ControlFlowGraph:
+    """Owns the per-function CFG including blocks, entry, exits, and analyses."""
     blocks: Dict[int, BasicBlock] = field(default_factory=dict)
     entry_block: Optional[int] = None
     exit_blocks: List[int] = field(default_factory=list)
@@ -227,11 +249,21 @@ class ControlFlowGraph:
         there exists a node satisfying `matcher` that postdominates the point
         of interest (e.g. an unlock after lock).
 
-        The actual dataflow/CFG logic will get implemented later.
+        The matcher receives BasicBlock objects. This implementation uses
+        the post-dominator sets computed during CFG finalization.
         """
-        # TODO: real CFG/postdom analysis
-        # TODO: real CFG/postdom analysis
-        return True
+        if not self.blocks or self.entry_block is None:
+            return False
+        entry_block = self.blocks.get(self.entry_block)
+        if entry_block is None:
+            return False
+        entry_postdoms = entry_block.postdominators
+        if not entry_postdoms:
+            return False
+        for block_id, block in self.blocks.items():
+            if block_id in entry_postdoms and matcher(block):
+                return True
+        return False
 
 
 # ============================================================
@@ -249,6 +281,7 @@ class BlockStmt:
     """
     statements: List[str] = field(default_factory=list)
     writes: List[WriteSite] = field(default_factory=list)
+    reads: List[ReadSite] = field(default_factory=list)
     calls: List[CallSite] = field(default_factory=list)
     locals_declared_here: List[Variable] = field(default_factory=list)
 
@@ -282,6 +315,7 @@ class LoopStmt:
 
 @dataclass
 class SwitchCaseBlock:
+    """Encapsulates a single `case` or `default` arm inside a switch statement."""
     labels: List[str]                     # e.g. ["STATE_ERR", "3"] or ["default"]
     body: BlockStmt
     source_range: Optional[SourceRange] = None
@@ -344,6 +378,7 @@ class Function:
 
 @dataclass
 class MacroDefinition:
+    """Represents a C macro emitted by the preprocessor walker."""
     name: str
     kind: Literal["object_like", "function_like"]
     params: List[str] = field(default_factory=list)
@@ -459,6 +494,7 @@ class Rule:
 
 @dataclass
 class ViolationContextFunction:
+    """Structured context describing the offending function when relevant."""
     name: str
     is_isr: bool
     linkage: str
@@ -467,6 +503,7 @@ class ViolationContextFunction:
 
 @dataclass
 class ViolationContextCall:
+    """Metadata for a call-site context attached to a violation."""
     callee: Optional[str]
     in_macro: bool
     in_branch: Optional[str]
@@ -475,18 +512,21 @@ class ViolationContextCall:
 
 @dataclass
 class ViolationContextCF:
+    """Records whether control-flow reasoning was path sensitive and exhaustive."""
     path_sensitive: bool
     all_paths_proven: bool
 
 
 @dataclass
 class ViolationContextPreproc:
+    """Summarizes preprocessor state active at the violation location."""
     active_defines: List[str]
     guard_condition: Optional[str]
 
 
 @dataclass
 class ViolationExtrasSymbol:
+    """Additional symbol metadata in violation extras (e.g., known policy flags)."""
     name: str
     decl_file: Optional[str]
     is_blocking_api: Optional[bool]
@@ -533,6 +573,24 @@ def _wrap_dynamic_callable(func: Any) -> Any:
     return _mark_safe_callable(_safe_wrapper)
 
 
+def _exists_helper(iterable: Any) -> bool:
+    for item in iterable:
+        if item:
+            return True
+    return False
+
+
+def _forall_helper(iterable: Any) -> bool:
+    for item in iterable:
+        if not item:
+            return False
+    return True
+
+
+def _count_helper(iterable: Any) -> int:
+    return sum(1 for _ in iterable)
+
+
 _SAFE_BASE_CALLABLES: Dict[str, Any] = {
     "len": _wrap_safe_callable(len),
     "any": _wrap_safe_callable(any),
@@ -542,6 +600,9 @@ _SAFE_BASE_CALLABLES: Dict[str, Any] = {
     "max": _wrap_safe_callable(max),
     "sorted": _wrap_safe_callable(sorted),
     "abs": _wrap_safe_callable(abs),
+    "exists": _wrap_safe_callable(_exists_helper),
+    "forall": _wrap_safe_callable(_forall_helper),
+    "count": _wrap_safe_callable(_count_helper),
 }
 
 TEMPLATE_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
@@ -803,12 +864,12 @@ class _SafeExpressionInterpreter:
 
 class RuleEngine:
     """
-    The RuleEngine will:
-    - take ProjectDB
-    - take list[Rule]
-    - walk the IR according to each rule's 'scope'
-    - run the rule's select/assert/exception logic
-    - emit Violations
+    Drives evaluation of YAML rules against the ProjectDB.
+
+    Responsibilities:
+    * Collect IR objects for each rule scope.
+    * Interpret the declarative DSL (select/assert/exceptions).
+    * Emit Violation objects with fully-populated context.
     """
 
     def __init__(self, project_db: ProjectDB, rules: List[Rule]) -> None:
@@ -823,8 +884,9 @@ class RuleEngine:
 
     def evaluate(self) -> List[Violation]:
         """
-        Iterate every rule, gather the IR nodes for the declared scope,
-        and run the lightweight Pythonic DSL that powers select/assert/exception.
+        Iterate each rule, gather candidates for the declared scope, bind aliases,
+        run `select` predicates, evaluate assertions/exceptions, and materialize
+        `Violation` objects when assertions fail.
         """
         violations: List[Violation] = []
 
@@ -937,6 +999,7 @@ class RuleEngine:
         return bindings, predicate
 
     def _create_base_env(self) -> Dict[str, Any]:
+        """Construct the safe evaluation environment shared by all expressions."""
         env: Dict[str, Any] = dict(_SAFE_BASE_CALLABLES)
         env.update(
             {
@@ -947,11 +1010,13 @@ class RuleEngine:
                 "call_edge": self._make_env_callable(self._call_edge_helper),
                 "calls_function": self._make_env_callable(self._calls_function_helper),
                 "call_path_exists": self._make_env_callable(self._call_path_helper),
+                "reachable_functions": self._make_env_callable(self._reachable_functions_helper),
             }
         )
         return env
 
     def _make_env_callable(self, func: Any) -> Any:
+        """Wrap helper functions so the AST interpreter treats them as safe."""
         @functools.wraps(func)
         def _wrapper(*args: Any, **kwargs: Any) -> Any:
             return func(*args, **kwargs)
@@ -959,6 +1024,10 @@ class RuleEngine:
         return _mark_safe_callable(_wrapper)
 
     def _assign_alias(self, env: Dict[str, Any], alias: str, node: Any, *, primary: bool = False) -> None:
+        """
+        Bind the alias name to the underlying IR node for downstream expressions.
+        The first binding also becomes `obj` for backwards compatibility.
+        """
         env[alias] = node
         if primary:
             env["obj"] = node
@@ -1024,6 +1093,7 @@ class RuleEngine:
         violations.append(self._build_violation(rule, env, node))
 
     def _call_edge_helper(self, caller: Any, callee: Any) -> bool:
+        """Return True if the ProjectDB call graph shows a direct call edge."""
         caller_name = self._extract_symbol_name(caller)
         callee_name = self._extract_symbol_name(callee)
         if not caller_name or not callee_name:
@@ -1031,6 +1101,7 @@ class RuleEngine:
         return callee_name in self.project_db.call_graph.get(caller_name, set())
 
     def _calls_function_helper(self, function_obj: Any, callee: Any) -> bool:
+        """Return True if `function_obj.calls` contains `callee` (name or object)."""
         if not isinstance(function_obj, Function):
             return False
         target = self._extract_symbol_name(callee)
@@ -1042,6 +1113,7 @@ class RuleEngine:
         return False
 
     def _call_path_helper(self, caller: Any, callee: Any, max_depth: int = 64) -> bool:
+        """Breadth-first search bounded by `max_depth` to find a path from caller to callee."""
         start = self._extract_symbol_name(caller)
         target = self._extract_symbol_name(callee)
         if not start or not target:
@@ -1061,6 +1133,25 @@ class RuleEngine:
                     visited.add(neighbor)
                     queue.append((neighbor, depth + 1))
         return False
+
+    def _reachable_functions_helper(self, caller: Any, max_depth: int = 64) -> List[str]:
+        """Return a sorted list of names reachable from `caller` within `max_depth` hops."""
+        start = self._extract_symbol_name(caller)
+        if not start:
+            return []
+        visited = set([start])
+        queue: deque[Tuple[str, int]] = deque([(start, 0)])
+        reachable: Set[str] = set()
+        while queue:
+            symbol, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            for neighbor in self.project_db.call_graph.get(symbol, set()):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    reachable.add(neighbor)
+                    queue.append((neighbor, depth + 1))
+        return sorted(reachable)
 
     def _extract_symbol_name(self, obj: Any) -> Optional[str]:
         if obj is None:
@@ -1337,9 +1428,10 @@ def load_rules_from_yaml(yaml_paths: List[str]) -> List[Rule]:
     """
     Load Rule objects from YAML rule files.
 
-    This implementation keeps PyYAML optional: if it is not installed we emit a
-    warning (when rule files were provided) and return an empty rule list so the
-    rest of the pipeline can proceed.
+    Behavior:
+    * Supports both list-based YAML streams and objects containing a `rules` list.
+    * Keeps PyYAML optional; missing dependency results in a warning plus empty rule set.
+    * Validates required fields and logs the offending file/doc when skipping malformed entries.
     """
     if not yaml_paths:
         return []
@@ -1431,8 +1523,9 @@ _CLANG_MISSING_WARNED = False
 def build_translation_unit_from_clang(path: str) -> TranslationUnit:
     """
     Parse a C file with libclang (when available) and hydrate the core IR.
-    Falls back to an empty TranslationUnit if libclang is unavailable or the
-    file cannot be parsed so that the rest of the pipeline keeps running.
+
+    Falls back to a stub (empty) translation unit if libclang is unavailable or the
+    file cannot be parsed so the CLI remains functional in constrained environments.
     """
     canonical_path = os.path.abspath(path)
 
@@ -1601,6 +1694,7 @@ def _collect_ir_nodes(
     clang_tu: "clang_cindex.TranslationUnit",
     canonical_main: str,
 ) -> Tuple[List[Function], List[Variable], List[MacroDefinition], List[TypeDecl]]:
+    """Walk the clang AST recursively, populating IR lists and wiring CFG metadata."""
     functions: List[Function] = []
     globals_list: List[Variable] = []
     macros: List[MacroDefinition] = []
@@ -1731,6 +1825,18 @@ def _collect_ir_nodes(
                 case_exits.append(switch_block.block_id)
             _set_pending_predecessors(current_function, case_exits or [switch_block.block_id])
 
+        if current_function is not None and clang_cindex is not None:
+            if cursor.kind in _STATEMENT_CURSOR_KINDS:
+                _record_statement_in_block(current_function, cursor, canonical_main)
+            if cursor.kind == clang_cindex.CursorKind.BINARY_OPERATOR and _looks_like_assignment(cursor):
+                block = _current_block(current_function)
+                if block is not None:
+                    _record_write_site(block, cursor, canonical_main)
+            if cursor.kind == clang_cindex.CursorKind.DECL_REF_EXPR:
+                block = _current_block(current_function)
+                if block is not None:
+                    block.reads.append(_record_read_site(cursor, canonical_main))
+
         try:
             children = list(cursor.get_children())
         except Exception:
@@ -1739,6 +1845,8 @@ def _collect_ir_nodes(
             visit(child, next_function)
 
     visit(clang_tu.cursor, None)
+    for fn in functions:
+        _finalize_function_cfg(fn)
     return functions, globals_list, macros, types
 
 
@@ -2104,6 +2212,7 @@ def _type_decl_from_cursor(
 
 
 def _initialize_function_cfg(function: Function) -> None:
+    """Ensure every function starts with a canonical entry block and CFG state."""
     if function.cfg.blocks:
         return
     entry_block = BasicBlock(
@@ -2136,7 +2245,12 @@ def _current_block_id(function: Function) -> Optional[int]:
 
 def _set_pending_predecessors(function: Function, preds: List[int]) -> None:
     state = _get_cfg_state(function)
-    state["pending_predecessors"] = list(preds)
+    preds = list(preds)
+    state["pending_predecessors"] = preds
+    if len(preds) == 1:
+        state["current_block_id"] = preds[0]
+    else:
+        state["current_block_id"] = None
 
 
 @contextmanager
@@ -2172,6 +2286,11 @@ def _record_basic_block(
     enclosing_construct: Optional[str] = None,
     branch_condition: Optional[str] = None,
 ) -> BasicBlock:
+    """
+    Create a new `BasicBlock` anchored to the provided cursor and connect it to
+    all pending predecessors. Pending predecessors are established by control
+    constructs (if/loop/switch) before visiting descendant cursors.
+    """
     state = _get_cfg_state(function)
     block_id = state["next_block_id"]
     state["next_block_id"] += 1
@@ -2224,6 +2343,131 @@ def _current_block(function: Function) -> Optional[BasicBlock]:
     if block_id is None:
         return None
     return function.cfg.blocks.get(block_id)
+
+
+def _finalize_function_cfg(function: Function) -> None:
+    cfg = function.cfg
+    if not cfg.blocks:
+        return
+    if cfg.entry_block is None:
+        cfg.entry_block = min(cfg.blocks.keys())
+    exit_blocks = [bid for bid, block in cfg.blocks.items() if not block.successors]
+    if not exit_blocks:
+        exit_blocks = [max(cfg.blocks.keys())]
+    cfg.exit_blocks = exit_blocks
+    for bid, block in cfg.blocks.items():
+        block.is_exit_block = bid in exit_blocks
+    function.exit_points = exit_blocks
+
+    block_ids = list(cfg.blocks.keys())
+    entry = cfg.entry_block
+    dominators: Dict[int, Set[int]] = {bid: set(block_ids) for bid in block_ids}
+    if entry is not None:
+        dominators[entry] = {entry}
+
+    changed = True
+    while changed:
+        changed = False
+        for bid in block_ids:
+            if bid == entry:
+                continue
+            block = cfg.blocks[bid]
+            preds = block.predecessors
+            if preds:
+                new_set = set(block_ids)
+                for pred in preds:
+                    new_set &= dominators.get(pred, set(block_ids))
+            else:
+                new_set = set(block_ids)
+            new_set.add(bid)
+            if new_set != dominators[bid]:
+                dominators[bid] = new_set
+                changed = True
+
+    for bid, doms in dominators.items():
+        cfg.blocks[bid].dominators = set(doms)
+
+    postdominators: Dict[int, Set[int]] = {bid: set(block_ids) for bid in block_ids}
+    for exit_id in exit_blocks:
+        postdominators[exit_id] = {exit_id}
+
+    changed = True
+    while changed:
+        changed = False
+        for bid in block_ids:
+            if bid in exit_blocks:
+                continue
+            block = cfg.blocks[bid]
+            succs = block.successors
+            if succs:
+                new_set = set(block_ids)
+                for succ in succs:
+                    new_set &= postdominators.get(succ, set(block_ids))
+            else:
+                new_set = set(block_ids)
+            new_set.add(bid)
+            if new_set != postdominators[bid]:
+                postdominators[bid] = new_set
+                changed = True
+
+    for bid, pdoms in postdominators.items():
+        cfg.blocks[bid].postdominators = set(pdoms)
+
+
+def _record_statement_in_block(
+    function: Optional[Function],
+    cursor: "clang_cindex.Cursor",
+    canonical_main: str,
+) -> None:
+    """
+    Attach a textual representation of the cursor to the current block,
+    synthesizing an implicit block when statements appear outside of an
+    explicit `_record_basic_block` context (rare with unstructured cursors).
+    """
+    if function is None:
+        return
+    block = _current_block(function)
+    if block is None:
+        state = _get_cfg_state(function)
+        pending = state.get("pending_predecessors", [])
+        if pending:
+            block = _record_basic_block(
+                function,
+                "block",
+                cursor,
+                canonical_main,
+            )
+        else:
+            return
+    snippet = _cursor_snippet(cursor)
+    if snippet:
+        block.statements.append(snippet)
+
+
+def _record_write_site(
+    container: Union[BasicBlock, BlockStmt],
+    cursor: "clang_cindex.Cursor",
+    canonical_main: str,
+) -> None:
+    """Append a WriteSite describing the cursor into the provided container."""
+    location = _make_source_range(cursor.extent, canonical_main)
+    site = WriteSite(
+        location=location,
+        preprocessor=PreprocessorContext(),
+    )
+    container.writes.append(site)
+
+
+def _record_read_site(
+    cursor: "clang_cindex.Cursor",
+    canonical_main: str,
+) -> ReadSite:
+    """Return a ReadSite (caller decides whether to attach to block or statement)."""
+    location = _make_source_range(cursor.extent, canonical_main)
+    return ReadSite(
+        location=location,
+        preprocessor=PreprocessorContext(),
+    )
 
 
 def _if_stmt_from_cursor(
@@ -2327,9 +2571,32 @@ def _block_stmt_from_cursor(
 ) -> BlockStmt:
     if cursor is None:
         return BlockStmt(statements=[], source_range=None, preprocessor=PreprocessorContext())
-    description = cursor.displayname or cursor.spelling or cursor.kind.name
+    statements: List[str] = []
+    writes: List[WriteSite] = []
+    calls: List[CallSite] = []
+    reads: List[ReadSite] = []
+    for child in cursor.get_children():
+        snippet = _cursor_snippet(child)
+        if snippet:
+            statements.append(snippet)
+        if child.kind == clang_cindex.CursorKind.CALL_EXPR:
+            call = _callsite_from_cursor(child, canonical_main)
+            if call:
+                calls.append(call)
+        elif child.kind == clang_cindex.CursorKind.DECL_REF_EXPR:
+            reads.append(_record_read_site(child, canonical_main))
+        elif child.kind == clang_cindex.CursorKind.BINARY_OPERATOR and _looks_like_assignment(child):
+            writes.append(
+                WriteSite(
+                    location=_make_source_range(child.extent, canonical_main),
+                    preprocessor=PreprocessorContext(),
+                )
+            )
     return BlockStmt(
-        statements=[description] if description else [],
+        statements=statements,
+        writes=writes,
+        reads=reads,
+        calls=calls,
         source_range=_make_source_range(cursor.extent, canonical_main),
         preprocessor=PreprocessorContext(),
     )
@@ -2358,6 +2625,32 @@ def _cursor_condition_text(cursor: "clang_cindex.Cursor") -> str:
     except Exception:
         pass
     return "<expr>"
+
+
+def _cursor_snippet(cursor: "clang_cindex.Cursor", token_limit: int = 32) -> str:
+    text = cursor.displayname or cursor.spelling
+    if text:
+        return text.strip()
+    try:
+        tokens = [t.spelling for t in cursor.get_tokens()]
+        if tokens:
+            return " ".join(tokens[:token_limit]).strip()
+    except Exception:
+        pass
+    return cursor.kind.name
+
+
+def _looks_like_assignment(cursor: "clang_cindex.Cursor") -> bool:
+    try:
+        tokens = [t.spelling for t in cursor.get_tokens()]
+    except Exception:
+        return False
+    joined = " ".join(tokens)
+    if "=" not in joined:
+        return False
+    if "==" in joined or "!=" in joined or ">=" in joined or "<=" in joined:
+        return False
+    return True
 def _type_is_const(ctype: Optional["clang_cindex.Type"]) -> bool:
     if ctype is None:
         return False
