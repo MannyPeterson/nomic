@@ -612,6 +612,82 @@ def semantic_statements(target: Any, predicate: Optional[Callable[..., bool]] = 
     return statements
 
 
+def _gather_paths_from_target(
+    target: Any,
+    *,
+    max_paths: int = 256,
+) -> List[List[BasicBlock]]:
+    if isinstance(target, Function):
+        return target.cfg.get_paths_to_exit(max_paths=max_paths)
+    if isinstance(target, ControlFlowGraph):
+        return target.get_paths_to_exit(max_paths=max_paths)
+    if isinstance(target, BasicBlock):
+        function = target.function
+        if function is None:
+            return [[target]]
+        cfg = function.cfg
+        paths: List[List[BasicBlock]] = []
+        stack: List[Tuple[int, List[int]]] = [(target.block_id, [target.block_id])]
+        while stack and len(paths) < max_paths:
+            block_id, path = stack.pop()
+            block = cfg.blocks.get(block_id)
+            if block is None:
+                continue
+            if block.is_exit_block or not block.successors:
+                paths.append([cfg.blocks[b] for b in path if b in cfg.blocks])
+                continue
+            for succ in block.successors:
+                if succ in path:
+                    continue
+                stack.append((succ, path + [succ]))
+        return paths
+    return []
+
+
+def path_matches(
+    target: Any,
+    pattern: str,
+    *,
+    ignore_case: bool = False,
+    multiline: bool = True,
+    dotall: bool = True,
+    max_paths: int = 256,
+) -> bool:
+    """Returns True if any control-flow path's textual representation matches the regex."""
+    paths = _gather_paths_from_target(target, max_paths=max_paths)
+    if not paths:
+        return False
+    for path in paths:
+        text = "\n".join(stmt.text for block in path for stmt in block.statements if stmt.text)
+        if pattern_matches(text, pattern, ignore_case=ignore_case, multiline=multiline, dotall=dotall):
+            return True
+    return False
+
+
+def path_requires(
+    target: Any,
+    *,
+    must_match: Optional[str] = None,
+    forbid_match: Optional[str] = None,
+    max_paths: int = 256,
+    pattern_kwargs: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """
+    Ensures that every path satisfies `must_match` (if provided) and that no path matches `forbid_match`.
+    """
+    pattern_kwargs = pattern_kwargs or {}
+    paths = _gather_paths_from_target(target, max_paths=max_paths)
+    if not paths:
+        return False
+    for path in paths:
+        text = "\n".join(stmt.text for block in path for stmt in block.statements if stmt.text)
+        if must_match and not pattern_matches(text, must_match, **pattern_kwargs):
+            return False
+        if forbid_match and pattern_matches(text, forbid_match, **pattern_kwargs):
+            return False
+    return True
+
+
 @dataclass
 class BasicBlock:
     """CFG node describing linearized statements plus intra-block calls/reads/writes."""
@@ -1342,6 +1418,81 @@ class ExpressionEvalError(Exception):
 
 _IMPLIES_KEYWORD = "implies"
 _BRACKET_PAIRS = {"(": ")", "[": "]", "{": "}"}
+_QUANTIFIER_KEYWORDS = ("exists", "forall", "count")
+
+
+def _rewrite_quantifiers(expr: str) -> str:
+    """
+    Support explicit quantifier syntax: e.g.
+        exists(item in collection if predicate)
+    Which is rewritten into a generator expression handed to the helper.
+    """
+    if not expr or not any(keyword in expr for keyword in _QUANTIFIER_KEYWORDS):
+        return expr
+
+    def _is_boundary(text: str, index: int, keyword: str) -> bool:
+        before = text[index - 1] if index > 0 else ""
+        after_index = index + len(keyword)
+        after = text[after_index] if after_index < len(text) else ""
+        return (not before or not (before.isalnum() or before == "_")) and (
+            not after or after.isspace() or after == "("
+        )
+
+    def _convert_body(body: str) -> str:
+        parts = body.split(" in ", 1)
+        if len(parts) != 2:
+            return body
+        target = parts[0].strip()
+        remainder = parts[1].strip()
+        if not target or not remainder:
+            return body
+        if " if " in remainder:
+            iterable_part, condition = remainder.split(" if ", 1)
+            iterable_part = iterable_part.strip()
+            condition = condition.strip()
+        else:
+            iterable_part = remainder
+            condition = ""
+        generator = f"{target} for {target} in ({iterable_part})"
+        if condition:
+            generator += f" if ({condition})"
+        return generator
+
+    result: List[str] = []
+    index = 0
+    length = len(expr)
+    while index < length:
+        matched = False
+        for keyword in _QUANTIFIER_KEYWORDS:
+            if expr.startswith(keyword, index) and _is_boundary(expr, index, keyword):
+                cursor = index + len(keyword)
+                while cursor < length and expr[cursor].isspace():
+                    cursor += 1
+                if cursor >= length or expr[cursor] != "(":
+                    continue
+                depth = 1
+                body_start = cursor + 1
+                cursor += 1
+                while cursor < length and depth > 0:
+                    ch = expr[cursor]
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                    cursor += 1
+                if depth != 0:
+                    # Unbalanced; leave expression untouched
+                    continue
+                body = expr[body_start : cursor - 1]
+                converted = _convert_body(body)
+                result.append(f"{keyword}({converted})")
+                index = cursor
+                matched = True
+                break
+        if not matched:
+            result.append(expr[index])
+            index += 1
+    return "".join(result)
 
 
 def _rewrite_implies_expression(expr: str) -> str:
@@ -1500,6 +1651,7 @@ class _SafeExpressionInterpreter:
         expr = expr.strip()
         if not expr:
             return True
+        expr = _rewrite_quantifiers(expr)
         expr = _rewrite_implies_expression(expr)
 
         try:
@@ -1900,6 +2052,10 @@ class RuleEngine:
                 "semantic_pattern_matches": self._make_env_callable(semantic_pattern_matches),
                 "semantic_pattern_any": self._make_env_callable(semantic_pattern_any),
                 "semantic_statements": self._make_env_callable(semantic_statements),
+                "path_matches": self._make_env_callable(path_matches),
+                "path_requires": self._make_env_callable(path_requires),
+                "policy_lookup": self._make_env_callable(self._policy_lookup_helper),
+                "function_policy": self._make_env_callable(self._function_policy_helper),
             }
         )
         return env
@@ -2060,6 +2216,25 @@ class RuleEngine:
                     visited.add(neighbor)
                     queue.append((neighbor, depth + 1))
         return False
+
+    def _policy_lookup_helper(self, module_name: str, key: Optional[str] = None, default: Any = None) -> Any:
+        module = self.project_db.module_rules.get(module_name)
+        if module is None:
+            return default
+        if key is None:
+            return module
+        if isinstance(module, dict):
+            return module.get(key, default)
+        return default
+
+    def _function_policy_helper(self, function_obj: Any, key: str, default: Any = None) -> Any:
+        symbol = self._extract_symbol_name(function_obj)
+        if not symbol:
+            return default
+        metadata = self.project_db.function_metadata.get(symbol)
+        if metadata is None:
+            return default
+        return metadata.get(key, default)
 
     def _extract_symbol_name(self, obj: Any) -> Optional[str]:
         if obj is None:

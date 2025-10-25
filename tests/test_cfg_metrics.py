@@ -65,6 +65,8 @@ class CFGMetricsTests(unittest.TestCase):
         self.assertFalse(nomic.all_paths_reach(self.entry, contains_cleanup))
         between = nomic.paths_between(self.entry, self.exit_block)
         self.assertEqual(len(between), 2)
+        self.assertTrue(nomic.path_matches(self.fn, r"cleanup"))
+        self.assertTrue(nomic.path_requires(self.fn, must_match="return"))
 
 
 if __name__ == "__main__":

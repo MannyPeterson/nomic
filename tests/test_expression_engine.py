@@ -26,6 +26,13 @@ class ExpressionEngineTests(unittest.TestCase):
         env["obj"] = Dummy()
         self.assertTrue(self.engine.evaluate("hasattr(obj, 'value')", env))
 
+    def test_explicit_quantifier_syntax(self) -> None:
+        env = dict(self.base_env)
+        env["items"] = [0, 1, 2]
+        self.assertTrue(self.engine.evaluate("exists(item in items if item == 2)", env))
+        self.assertFalse(self.engine.evaluate("forall(item in items)", env))
+        self.assertEqual(self.engine.evaluate("count(item in items if item % 2 == 1)", env), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

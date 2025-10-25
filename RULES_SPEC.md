@@ -111,8 +111,24 @@ The DSL is a restricted subset of Python evaluated via an AST interpreter—no `
 | `semantic_pattern_matches(target, predicate=None, pattern=None, pattern_scope='statement', max_results=256, pattern_kwargs=None)` | Combined semantic + regex search returning rich match objects. |
 | `semantic_pattern_any(...)`   | Boolean convenience wrapper around `semantic_pattern_matches`.             |
 | `semantic_statements(target, predicate=None)` | Returns statements that satisfy a predicate.                                  |
+| `path_matches(target, pattern, **kwargs)` | True if any CFG path from `target` matches the regex.                       |
+| `path_requires(target, must_match=None, forbid_match=None, **kwargs)` | Ensures every path satisfies/avoids the given pattern.          |
+| `policy_lookup(module_name, key=None, default=None)` | Fetches data from `ProjectDB.module_rules`.                                 |
+| `function_policy(function, key, default=None)` | Reads metadata attached to the function (e.g., policy flags).              |
 
 Every helper is exposed as a safe callable; you can pass either objects (e.g. `Function`) or strings. When a string is provided, it is interpreted as a symbol name.
+
+#### Quantifier Syntax
+
+In addition to passing generator expressions directly, the DSL now supports explicit quantifier keywords:
+
+```
+exists(stmt in fn.all_statements if stmt.contains_call)
+forall(call in fn.calls if call.is_blocking_api)
+count(block in fn.cfg.blocks.values() if block.is_loop_header)
+```
+
+Each form is rewritten into the equivalent generator expression (so nesting and complex `iterable` or `if` clauses are supported as long as the expression fits inside the parentheses).
 
 #### Pattern & Semantic Matching
 
@@ -123,11 +139,15 @@ Every helper is exposed as a safe callable; you can pass either objects (e.g. `F
 ### Example Assertions
 
 ```yaml
-assert_code: "forall(call in caller.calls for call in caller.calls if call.is_blocking_api implies caller.is_isr)"
+assert_code: "forall(call in fn.calls if call.is_lock) implies fn.has_mutex_protection"
 
-assert_code: "exists(reachable_functions(caller) if fn.startswith('crit_') for fn in reachable_functions(caller))"
+assert_code: "exists(stmt in fn.all_statements if semantic_pattern_any(stmt, pattern='LOG_'))"
 
-assert_code: "not call_path_exists(caller, 'malloc')"
+assert_code: "path_requires(fn, must_match='cleanup', forbid_match='sleep_ms')"
+
+assert_code: "policy_lookup('drivers/uart', 'allow_blocking', False)"
+
+assert_code: "function_policy(fn, 'allow_blocking', False) or not call_path_exists(fn, 'sleep_ms')"
 ```
 
 ---
@@ -239,6 +259,10 @@ As the DSL grows (e.g., explicit quantifier keywords, path matchers, policy modu
 | `paths_between(block1, block2, max_paths=256)` | `List[List[BasicBlock]]` | Enumerates CFG paths. |
 | `pattern_search/ pattern_matches/ pattern_findall/ pattern_extract` | see above | Multi-line regex helpers returning `PatternMatch` metadata. |
 | `semantic_pattern_matches(...)` / `semantic_pattern_any(...)` / `semantic_statements(...)` | see above | Combine statement predicates with regexes to yield `SemanticMatch` objects. |
+| `path_matches(target, pattern, **kwargs)` | `bool` | True if any CFG path matches `pattern`. |
+| `path_requires(target, must_match=None, forbid_match=None, **kwargs)` | `bool` | All paths must satisfy/avoid the supplied patterns. |
+| `policy_lookup(module_name, key=None, default=None)` | `Any` | Reads entries from `ProjectDB.module_rules`. |
+| `function_policy(function, key, default=None)` | `Any` | Reads per-function metadata (policy flags). |
 | `exists(iterable)` / `forall(iterable)` / `count(iterable)` | quantifier helpers | Work well with comprehensions: `exists(call for call in fn.calls if call.is_blocking_api)` |
 
 All helpers are exposed via `_make_env_callable`, ensuring they comply with the safe-eval environment.

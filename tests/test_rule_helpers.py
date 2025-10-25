@@ -19,6 +19,11 @@ def build_project_with_two_functions():
         "beta_handler": [fn_beta],
     }
     project.call_graph = {"alpha_service": {"beta_handler"}, "beta_handler": set()}
+    project.module_rules = {"drivers/alpha": {"allow_blocking": False}}
+    project.function_metadata = {
+        "alpha_service": {"allow_blocking": False},
+        "beta_handler": {"allow_blocking": True},
+    }
     return project, fn_alpha, fn_beta
 
 
@@ -44,6 +49,13 @@ class RuleHelperTests(unittest.TestCase):
         for helper_name in pattern_helpers:
             helper = self.env[helper_name]
             self.assertTrue(getattr(helper, "_nomic_safe_callable", False))
+
+    def test_policy_helpers(self) -> None:
+        policy_lookup = self.env["policy_lookup"]
+        function_policy = self.env["function_policy"]
+        self.assertFalse(policy_lookup("drivers/alpha", "allow_blocking", True))
+        self.assertFalse(function_policy(self.fn_alpha, "allow_blocking", True))
+        self.assertTrue(function_policy(self.fn_beta, "allow_blocking", False))
 
     def test_compute_call_graph_dominators(self) -> None:
         dominators = nomic._compute_call_graph_dominators(self.engine.project_db.call_graph)
